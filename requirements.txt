@@ -1,0 +1,8 @@
+# ROOT (PyROOT, >= 6.28) is also required; it is not on PyPI: install it with conda-forge (conda install -c conda-forge root)
+# or use an LCG view / your system ROOT.
+streamlit>=1.40
+plotly>=5.20
+pandas>=2.0
+numpy>=1.24
+numexpr>=2.8
+uproot>=5.0

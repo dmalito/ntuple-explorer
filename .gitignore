@@ -1,0 +1,14 @@
+# data and caches
+*.root
+.ntuple_cache/
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+# editors / OS
+.DS_Store
+.idea/
+.vscode/
+.ipynb_checkpoints/

@@ -1,0 +1,12 @@
+# used when running `streamlit run ntuple_explorer/app.py` from the repository folder
+# (python -m ntuple_explorer passes the same options itself)
+[server]
+address = "localhost"     # the app compiles C++ typed into it: do not expose it on a network
+headless = true
+maxUploadSize = 5
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+base = "light"
