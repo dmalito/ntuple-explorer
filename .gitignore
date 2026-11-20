@@ -1,6 +1,8 @@
 # data and caches
 *.root
 .ntuple_cache/
+# local presets (your analyses: never committed)
+/presets/
 # python
 __pycache__/
 *.py[cod]
@@ -12,3 +14,5 @@ venv/
 .idea/
 .vscode/
 .ipynb_checkpoints/
+# personal Claude Code notes
+CLAUDE.local.md

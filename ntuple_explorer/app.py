@@ -119,8 +119,9 @@ with st.sidebar.expander("Data", expanded="active" not in st.session_state):
     if not path or not loader.resolve(path).exists():
         st.warning("File not found")
         st.stop()
-    entries = st.number_input("Max entries (0 = all)", min_value=0, value=0, step=100000, key=f"entries_{mode}",
+    entries = st.number_input("Max entries (-1 = all)", min_value=-1, value=-1, step=100000, key=f"entries_{mode}",
                               help="Reads only the first N entries (single-threaded) - quick looks at huge files")
+    entries = max(int(entries), 0)      # loader / cache key convention: 0 = all
 
     if P:
         tree = P["tree"]
@@ -216,11 +217,26 @@ class _StatsProxy:
 
 
 def _src(name):
+    if name in user_defs:
+        return f"{user_defs[name]}|{alias_choices}"
     s = view.aliases.get(name)
     return s if isinstance(s, str) else (id(s) if s is not None else "")
 
 
 SC = _StatsProxy()
+unusable = {}           # derived columns that cannot be computed for this file (e.g. an input branch is missing)
+
+
+def usable(name):
+    """False (and the reason in `unusable`) for a column that raises when computed; loaded columns are always fine."""
+    if name in view.df.columns and name not in view.aliases:
+        return True
+    try:
+        stats_for(name)
+        return True
+    except Exception as e:      # noqa: BLE001
+        unusable[name] = f"{type(e).__name__}: {e}"
+        return False
 
 # ---- state save / load (before widgets are created)
 state_prefix = f"ctl_{pid}_"
@@ -240,8 +256,27 @@ with st.sidebar.expander("Save / load selection"):
                 st.error(f"bad state file: {e}")
     state_slot = st.empty()
 
+# ---- main page: header (filled once the masks are known), page-cut box, tabs
+header_box = st.container()
+page_open = bool(st.session_state.get(f"{state_prefix}page_cols")) or any(
+    s.get("place") == "main" for s in (P.get("controls", []) if P else []))
+page_box = st.expander("Page cuts · applied to every plot and table, not cutflow steps", expanded=page_open)
+page_top, page_grid = page_box.container(), page_box.container()
+PAGE_NCOL = 3
+_page_cells = []
+
+
+def page_cell():
+    """Next cell of the page-cut grid (PAGE_NCOL controls per row)."""
+    if not _page_cells:
+        _page_cells.extend(page_grid.columns(PAGE_NCOL))
+    return _page_cells.pop(0)
+
+
 st.sidebar.markdown("### Selection")
 results = []
+user_defs = {}          # new columns typed in the app: name -> expression
+alias_choices = ()
 
 
 def _alias_ok(spec):
@@ -271,37 +306,127 @@ for i, spec in enumerate(specs):
         spec = _alias_ok(spec)
         if spec is None:
             continue
-    if any(c not in view for c in _refs(spec)):
+    if any(c not in view or not usable(c) for c in _refs(spec)):
         continue
     if spec["kind"] in ("multiselect", "range") and spec.get("labels") is None and spec["column"] in labels:
         spec = dict(spec, labels=labels[spec["column"]])
+    on_page = spec.get("place") == "main"
+    box = page_cell() if on_page else st.sidebar
     try:
-        r = ctl.render(spec, view, f"{state_prefix}{i}", SC, container=st.sidebar)
+        r = ctl.render(spec, view, f"{state_prefix}{i}", SC, container=box)
     except Exception as e:      # noqa: BLE001
-        st.sidebar.error(f"{spec.get('label', spec['kind'])}: {type(e).__name__}: {e}")
+        box.error(f"{spec.get('label', spec['kind'])}: {type(e).__name__}: {e}")
         continue
     if r["aliases"]:
         view.aliases.update(r["aliases"])
         view._memo.clear()
+    r["page"] = on_page
     results.append(r)
+alias_choices = tuple((r["label"], r.get("choice")) for r in results if r["kind"] == "alias")
+
+# ---- new columns: expressions over loaded columns, computed in memory (no reload)
+defs_key = f"{state_prefix}newcols"
+COMBINE = {
+    "OR (any ≠ 0)": lambda cs: " | ".join(f"({c} != 0)" for c in cs),
+    "AND (all ≠ 0)": lambda cs: " & ".join(f"({c} != 0)" for c in cs),
+    "max": lambda cs: f"max({', '.join(cs)})",
+    "min": lambda cs: f"min({', '.join(cs)})",
+    "sum": lambda cs: " + ".join(cs),
+    "count ≠ 0": lambda cs: f"count({', '.join(f'{c} != 0' for c in cs)})",
+}
+
+
+def _add_combined(cols, op, name):
+    """Button callback: append `name = <combination>` to the new-column definitions."""
+    if not cols:
+        return
+    name = name.strip() or "_".join([op.split()[0].lower()] + list(cols))
+    cur = st.session_state.get(defs_key, "")
+    st.session_state[defs_key] = (cur.rstrip() + "\n" if cur.strip() else "") + f"{name} = {COMBINE[op](cols)}"
+
+
+def _as_column(a):
+    a = np.asarray(a)
+    return a.astype(np.int8) if a.dtype.kind == "b" else a
+
+
+with st.sidebar.expander("New columns", expanded=bool(st.session_state.get(defs_key))):
+    defs_txt = st.text_area(
+        "One per line: `name = expression`", key=defs_key, height=100,
+        placeholder="lep_ok = (pass_e == 1) | (pass_mu == 1)\nnsm_max = max(nsm_a, nsm_b)",
+        help="Over loaded columns, computed in memory (no reload). Operators: + - * / ** == != < <= > >=, "
+             "& | ~ (or and / or / not, && / || / !), `a if cond else b`. Functions: max, min, where(cond, a, b), "
+             "count(cond, ...), isin(x, v1, v2, ...), abs, sqrt, exp, log, log10, sin, cos, tan, arctan2, hypot, "
+             "floor, ceil. Conditions give 0/1 columns. New columns can get sliders / selectors and be plotted.")
+    for ln, line in enumerate(defs_txt.splitlines(), 1):
+        s_ = line.split("#", 1)[0].strip()
+        if not s_:
+            continue
+        n_, _, e_ = s_.partition("=")
+        n_, e_ = n_.strip(), e_.strip()
+        if not n_.isidentifier() or not e_ or e_.startswith("="):
+            st.error(f"line {ln}: expected `name = expression`")
+            continue
+        if n_ in view:
+            st.error(f"line {ln}: `{n_}` already exists")
+            continue
+        view.derived[n_] = (lambda e: lambda v: _as_column(v.eval(e)))(e_)
+        try:
+            _ = view[n_]        # (a bare expression would be st.write-n by Streamlit "magic")
+            user_defs[n_] = e_
+        except Exception as e:      # noqa: BLE001
+            del view.derived[n_]
+            view._memo.pop(n_, None)
+            st.error(f"line {ln} `{n_}`: {type(e).__name__}: {e}")
+    st.markdown("**Combine columns**")
+    cc = st.multiselect("Columns", [c for c in view.names() if not c.startswith("__") and usable(c)],
+                        key=f"{state_prefix}comb_cols")
+    k1, k2 = st.columns(2)
+    cop = k1.selectbox("as", list(COMBINE), key=f"{state_prefix}comb_op",
+                       help="OR / AND / count: of `column ≠ 0`; max: a slider on it at ≥ x is an OR of `column ≥ x`")
+    cname = k2.text_input("name", key=f"{state_prefix}comb_name", placeholder="automatic")
+    st.button("Add column", on_click=_add_combined, args=(tuple(cc), cop, cname), disabled=not cc,
+              use_container_width=True)
 
 # ---- extra / generic cuts on any column
-all_cols = [c for c in view.names() if not c.startswith("__")]
+all_cols = [c for c in view.names() if not c.startswith("__") and usable(c)]
 default_extra = all_cols if (not P and len(all_cols) <= 8) else []
 with st.sidebar.expander("Cuts on any column", expanded=not P):
     extra_cols = st.multiselect("Add a slider / selector for", all_cols, default=default_extra,
                                 key=f"{state_prefix}extra_cols")
-for c in extra_cols:
+    int_as = st.radio("Integer columns with ≤ 20 values as", ["slider", "selector"], horizontal=True,
+                      key=f"{state_prefix}extra_int_as",
+                      help="slider: a range (counts such as n jets); selector: pick individual values. "
+                           "Columns with labels and 0/1 flags always get a selector. Also used for page cuts.")
+
+
+def auto_control(c, prefix, box, page):
+    """Slider / selector chosen from the column's values; its result (tagged page or not) goes to results."""
     try:
-        spec = ctl.auto_spec(view, c, SC)
-        if c in labels:
-            spec["labels"] = labels[c]
-        results.append(ctl.render(spec, view, f"{state_prefix}auto_{c}", SC, container=st.sidebar))
+        spec = ctl.auto_spec(view, c, SC, labels=labels.get(c), int_slider=int_as == "slider")
+        if page:
+            spec["place"] = "main"
+        # one widget key per kind: a slider cannot take over the state of a multiselect
+        key = f"{prefix}{c}" + ("__range" if spec["kind"] == "range" and stats_for(c)["kind"] == "cat" else "")
+        r = ctl.render(spec, view, key, SC, container=box)
+        r["page"] = page
+        results.append(r)
     except Exception as e:      # noqa: BLE001
-        st.sidebar.error(f"{c}: {type(e).__name__}: {e}")
+        box.error(f"{c}: {type(e).__name__}: {e}")
+
+
+for c in extra_cols:
+    auto_control(c, f"{state_prefix}auto_", st.sidebar, False)
 if not P:
-    results.append(ctl.render(dict(kind="expr", label="Expression cut"), view, f"{state_prefix}expr", SC,
-                              container=st.sidebar))
+    results.append(dict(ctl.render(dict(kind="expr", label="Expression cut"), view, f"{state_prefix}expr", SC,
+                                   container=st.sidebar), page=False))
+
+# ---- page cuts on any column (main page, above the tabs)
+page_cols = page_top.multiselect("Add a page cut (slider / selector) on", all_cols, key=f"{state_prefix}page_cols",
+                                 help="Applied to every plot, table and the header numbers, on top of the sidebar "
+                                      "selection; in the cutflow they make one last row, 'after page cuts'.")
+for c in page_cols:
+    auto_control(c, f"{state_prefix}page_", page_cell(), True)
 
 # ---- weight
 if P and P.get("weight") and P["weight"] in view:
@@ -313,9 +438,12 @@ else:
     w = np.ones(len(view), np.float32) if wsel == "(none)" else view[wsel].astype(np.float32)
     wname = wsel
 
+sel_results = [r for r in results if not r.get("page")]
+page_results = [r for r in results if r.get("page")]
 mask = ctl.combine(results)
+side_mask = ctl.combine(sel_results)
 W = plots.weights(w)            # float64 weights and squares, once per rerun
-alias_sig = tuple((r["label"], r.get("choice")) for r in results if r["kind"] == "alias")
+alias_sig = tuple((r["label"], r.get("choice")) for r in results if r["kind"] == "alias") + tuple(user_defs.items())
 if mask is None:
     mask = np.ones(len(view), bool)
 
@@ -328,24 +456,36 @@ state_slot.download_button("Save state (.json)", json.dumps(state, indent=1), fi
 # ----------------------------------------------------------------- header
 n_all, n_sel = len(view), int(mask.sum())
 sw_all, sw_sel = float(W[0].sum()), float(W[0][mask].sum())
-st.markdown(f"#### {mode if P else 'Generic'} · `{Path(active['path']).name}` : `{active['tree']}`")
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("Entries loaded", f"{n_all:,}")
-m2.metric("Selected", f"{n_sel:,}", f"{n_sel / n_all:.2%}" if n_all else None, delta_color="off")
-m3.metric("Σw selected", f"{sw_sel:.5g}", f"{sw_sel / sw_all:.2%} of Σw" if sw_all else None, delta_color="off")
-m4.metric("Load", f"{t_load:.1f} s", "cached" if t_load < 2 else "event loop", delta_color="off")
-if dropped:
-    st.caption("Columns not in this file (skipped): " + ", ".join(f"`{k}`" for k in dropped))
-for fname, err in df.attrs.get("friend_errors", {}).items():
-    st.warning(f"Friend tree {fname!r} not joined: {err}")
-desc = [r["desc"] for r in results if r["desc"]]
-with st.expander("Selection as expression"):
-    st.code(" &&\n".join(desc) or "(no cuts)", language="cpp")
-    st.caption(f"weight: {wname}. `[…]` entries are column choices or Python-defined cuts.")
+page_cutting = any(r["mask"] is not None for r in page_results)
+with header_box:
+    st.markdown(f"#### {mode if P else 'Generic'} · `{Path(active['path']).name}` : `{active['tree']}`")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Entries loaded", f"{n_all:,}")
+    m2.metric("Selected", f"{n_sel:,}", f"{n_sel / n_all:.2%}" if n_all else None, delta_color="off")
+    m3.metric("Σw selected", f"{sw_sel:.5g}", f"{sw_sel / sw_all:.2%} of Σw" if sw_all else None, delta_color="off")
+    m4.metric("Load", f"{t_load:.1f} s", "cached" if t_load < 2 else "event loop", delta_color="off")
+    if page_cutting:
+        n_side = n_all if side_mask is None else int(side_mask.sum())
+        st.caption(f"Sidebar selection: {n_side:,} entries; the page cuts keep {n_sel:,} of them "
+                   f"({n_sel / n_side:.2%})." if n_side else "Sidebar selection: no entries.")
+    if dropped:
+        st.caption("Columns not in this file (skipped): " + ", ".join(f"`{k}`" for k in dropped))
+    if unusable:
+        st.caption("Derived columns not available for this file (skipped): "
+                   + ", ".join(f"`{k}`" for k in unusable), help="\n\n".join(f"{k}: {v}" for k, v in unusable.items()))
+    for fname, err in df.attrs.get("friend_errors", {}).items():
+        st.warning(f"Friend tree {fname!r} not joined: {err}")
+    desc = [r["desc"] for r in sel_results if r["desc"]]
+    pdesc = [r["desc"] for r in page_results if r["desc"]]
+    with st.expander("Selection as expression"):
+        st.code((" &&\n".join(desc) or "(no cuts)") + ("\n// page cuts (not cutflow steps)\n&& " + " &&\n".join(pdesc)
+                                                        if pdesc else ""), language="cpp")
+        extra = "; new columns: " + ", ".join(f"`{n} = {e}`" for n, e in user_defs.items()) if user_defs else ""
+        st.caption(f"weight: {wname}. `[…]` entries are column choices or Python-defined cuts{extra}.")
 
 # ----------------------------------------------------------------- tabs
 cat_cols = [c for c in all_cols if c in labels or stats_for(c)["kind"] == "cat"]
-stack_opts = [c for c in (P.get("stack_options", []) if P else cat_cols) if c in view]
+stack_opts = [c for c in (P.get("stack_options", []) if P else cat_cols) if c in all_cols]
 custom = (P.get("custom") or {}) if P else {}
 colors = (P.get("colors") or {}) if P else {}
 
@@ -361,13 +501,23 @@ def names_for(c):
     return out
 
 
-tabs = st.tabs(["Plots", "2D", "Composition", "Cutflow & yields"] + list(custom))
+# ---- variables to plot: a collapsible box above the tabs
+plot_specs = [s for s in (P.get("plots", []) if P else []) if s["column"] in all_cols]
+default_plot_cols = [s["column"] for s in plot_specs] or [c for c in all_cols if c not in ("runNumber", "eventNumber")][:6]
+plots_key = f"{state_prefix}plots"
+if plots_key in st.session_state:       # drop columns that no longer exist (e.g. a removed new column)
+    st.session_state[plots_key] = [c for c in st.session_state[plots_key] if c in all_cols]
+n_plot = len(st.session_state.get(plots_key, default_plot_cols))
+with st.expander(f"Variables to plot ({n_plot})", expanded=False):
+    plot_cols = st.multiselect("Variables (Plots tab)", all_cols, default=default_plot_cols, key=plots_key,
+                               label_visibility="collapsed")
 
-with tabs[0]:
-    plot_specs = [s for s in (P.get("plots", []) if P else []) if s["column"] in view]
-    default_plot_cols = [s["column"] for s in plot_specs] or [c for c in all_cols if c not in ("runNumber", "eventNumber")][:6]
-    o1, o2, o3, o4, o5, o6 = st.columns([3, 1, 1, 1, 1, 2])
-    plot_cols = o1.multiselect("Variables", all_cols, default=default_plot_cols, key=f"{state_prefix}plots")
+tab_names = ["Plots", "2D"] + (["Composition"] if P and P.get("compositions") else []) + ["Cutflow & yields"]
+all_tabs = st.tabs(tab_names + list(custom))
+tabs = dict(zip(tab_names, all_tabs))
+
+with tabs["Plots"]:
+    o2, o3, o4, o5, o6 = st.columns([1, 1, 1, 1, 2])
     norm = o2.toggle("Normalise", key="opt_norm")
     logy = o3.toggle("Log y", key="opt_logy")
     ratio = o4.toggle("Ratio", value=True, key="opt_ratio", help="selected / before selection per bin")
@@ -408,15 +558,22 @@ with tabs[0]:
         except Exception as e:      # noqa: BLE001
             grid[k % ncol].error(f"{c}: {type(e).__name__}: {e}")
 
-with tabs[1]:
-    a1, a2, a3 = st.columns([2, 2, 1])
+with tabs["2D"]:
+    a1, a2, a3, a4, a5 = st.columns([2, 2, 2, 2, 1])
     xs = a1.selectbox("x", all_cols, index=0, key=f"{state_prefix}x2d")
     ys = a2.selectbox("y", all_cols, index=min(1, len(all_cols) - 1), key=f"{state_prefix}y2d")
-    logz = a3.toggle("Log z", key="opt_logz")
+    norms2d = {"Σw": "none", "% of total": "total", "% of row": "row", "% of column": "column"}
+    n2d = a3.selectbox("Normalise", list(norms2d), key=f"{state_prefix}norm2d",
+                       help="row: each y bin adds up to 100 %; column: each x bin adds up to 100 %")
+    texts2d = {"none": None, "value": "value", "entries (N)": "entries"}
+    t2d = a4.selectbox("Numbers in bins", list(texts2d), key=f"{state_prefix}text2d",
+                       help="value: the coloured quantity; entries: unweighted number of entries")
+    logz = a5.toggle("Log z", key="opt_logz")
     try:
         bx = plots.binning(view[xs], {"labels": labels.get(xs)}, stats_for(xs))
         by = plots.binning(view[ys], {"labels": labels.get(ys)}, stats_for(ys))
-        st.plotly_chart(plots.hist2d(view[xs], view[ys], w, mask, bx, by, xs, ys, logz), use_container_width=True)
+        st.plotly_chart(plots.hist2d(view[xs], view[ys], w, mask, bx, by, xs, ys, logz, norm=norms2d[n2d],
+                                     text=texts2d[t2d]), use_container_width=True)
     except Exception as e:      # noqa: BLE001
         st.error(f"{type(e).__name__}: {e}")
 
@@ -439,50 +596,54 @@ def show_composition(cs, key):
                            mime="text/csv", key=f"compcsv_{key}")
 
 
-with tabs[2]:
-    comp_specs = [c for c in (P.get("compositions") or [] if P else [])
-                  if all(view.__contains__(c[k]) for k in ("rows", "segments") if c.get(k))
-                  and (not c.get("facet") or c["facet"] in view)]
-    if cat_cols:
-        d0 = comp_specs[0] if comp_specs else {}
-        norms = {"% of row": "row", "% of total": "total", "Σw (yields)": "yields"}
+if "Composition" in tabs:
+    with tabs["Composition"]:
+        comp_specs = [c for c in (P.get("compositions") or [] if P else [])
+                      if all(c[k] in all_cols for k in ("rows", "segments") if c.get(k))
+                      and (not c.get("facet") or c["facet"] in all_cols)]
+        if cat_cols:
+            d0 = comp_specs[0] if comp_specs else {}
+            norms = {"% of row": "row", "% of total": "total", "Σw (yields)": "yields"}
 
-        def _ix(opts, v, fallback=0):
-            return opts.index(v) if v in opts else fallback
+            def _ix(opts, v, fallback=0):
+                return opts.index(v) if v in opts else fallback
 
-        b1, b2, b3, b4, b5 = st.columns([2, 2, 2, 2, 1])
-        rows_c = b1.selectbox("Rows (bars)", cat_cols, index=_ix(cat_cols, d0.get("rows")), key=f"{state_prefix}comp_rows")
-        seg_c = b2.selectbox("Segments (stacked)", cat_cols, index=_ix(cat_cols, d0.get("segments"), min(1, len(cat_cols) - 1)),
-                             key=f"{state_prefix}comp_seg")
-        nlab = b3.radio("Normalise", list(norms), horizontal=True, key=f"{state_prefix}comp_norm",
-                        index=_ix(list(norms.values()), d0.get("norm", "row")))
-        fac_opts = ["(none)"] + [c for c in cat_cols if c not in (rows_c, seg_c)]
-        fac_c = b4.selectbox("Split into panels by", fac_opts, key=f"{state_prefix}comp_facet",
-                             help="one panel for all entries plus one per class (small multiples)")
-        horiz = b5.toggle("Horizontal", value=d0.get("horizontal", True), key=f"{state_prefix}comp_h")
-        c1, c2 = st.columns([4, 1])
-        where = c1.text_input("Only entries with (expression, on top of the sidebar selection)", key=f"{state_prefix}comp_where",
-                              placeholder="e.g. match_status == 0")
-        use_sel = c2.toggle("Sidebar selection", value=True, key=f"{state_prefix}comp_sel")
-        try:
-            show_composition(dict(rows=rows_c, segments=seg_c, norm=norms[nlab], horizontal=horiz,
-                                  facet=None if fac_c == "(none)" else fac_c, where=where, selection=use_sel,
-                                  title=f"{seg_c} per {rows_c}"), "builder")
-        except Exception as e:      # noqa: BLE001
-            st.error(f"{type(e).__name__}: {e}")
-    else:
-        st.info("No categorical columns loaded (integer-like with ≤ 20 values, or with labels).")
-    if comp_specs:
-        st.markdown("---\n**Preset panels** (sidebar selection applied)")
-        for i, cs in enumerate(comp_specs):
+            b1, b2, b3, b4, b5 = st.columns([2, 2, 2, 2, 1])
+            rows_c = b1.selectbox("Rows (bars)", cat_cols, index=_ix(cat_cols, d0.get("rows")), key=f"{state_prefix}comp_rows")
+            seg_c = b2.selectbox("Segments (stacked)", cat_cols, index=_ix(cat_cols, d0.get("segments"), min(1, len(cat_cols) - 1)),
+                                 key=f"{state_prefix}comp_seg")
+            nlab = b3.radio("Normalise", list(norms), horizontal=True, key=f"{state_prefix}comp_norm",
+                            index=_ix(list(norms.values()), d0.get("norm", "row")))
+            fac_opts = ["(none)"] + [c for c in cat_cols if c not in (rows_c, seg_c)]
+            fac_c = b4.selectbox("Split into panels by", fac_opts, key=f"{state_prefix}comp_facet",
+                                 help="one panel for all entries plus one per class (small multiples)")
+            horiz = b5.toggle("Horizontal", value=d0.get("horizontal", True), key=f"{state_prefix}comp_h")
+            c1, c2 = st.columns([4, 1])
+            where = c1.text_input("Only entries with (expression, on top of the sidebar selection)", key=f"{state_prefix}comp_where",
+                                  placeholder="e.g. match_status == 0")
+            use_sel = c2.toggle("Sidebar selection", value=True, key=f"{state_prefix}comp_sel")
             try:
-                show_composition(cs, f"preset{i}")
+                show_composition(dict(rows=rows_c, segments=seg_c, norm=norms[nlab], horizontal=horiz,
+                                      facet=None if fac_c == "(none)" else fac_c, where=where, selection=use_sel,
+                                      title=f"{seg_c} per {rows_c}"), "builder")
             except Exception as e:      # noqa: BLE001
-                st.error(f"{cs.get('title', i)}: {type(e).__name__}: {e}")
+                st.error(f"{type(e).__name__}: {e}")
+        else:
+            st.info("No categorical columns loaded (integer-like with ≤ 20 values, or with labels).")
+        if comp_specs:
+            st.markdown("---\n**Preset panels** (sidebar selection applied)")
+            for i, cs in enumerate(comp_specs):
+                try:
+                    show_composition(cs, f"preset{i}")
+                except Exception as e:      # noqa: BLE001
+                    st.error(f"{cs.get('title', i)}: {type(e).__name__}: {e}")
 
-with tabs[3]:
-    cf = plots.cutflow(results, w)
-    st.markdown("**Cutflow** (controls applied cumulatively, in sidebar order)")
+with tabs["Cutflow & yields"]:
+    cf = plots.cutflow(sel_results, w, page=page_results)
+    h1, h2 = st.columns([5, 1])
+    h1.markdown("**Cutflow** (controls applied cumulatively, in sidebar order)")
+    cf_log = h2.toggle("Log x", key="opt_cf_log")
+    st.plotly_chart(plots.cutflow_fig(cf, logx=cf_log), use_container_width=True, key="cutflow_fig")
     show_table(cf, {"sumw": "{:.5g}", "err": "{:.3g}", "eff_step": "{:.4f}", "eff_total": "{:.4f}"})
     st.download_button("Cutflow CSV", cf.to_csv(index=False), file_name=f"cutflow_{pid}.csv", mime="text/csv")
     if cat_cols:
@@ -494,7 +655,7 @@ with tabs[3]:
         show_table(yt, {"sumw": "{:.5g}", "err": "{:.3g}", "fraction": "{:.4f}"})
         st.download_button("Yields CSV", yt.to_csv(index=False), file_name=f"yields_{yc}_{pid}.csv", mime="text/csv")
 
-for tab, (title, fn) in zip(tabs[4:], custom.items()):
+for tab, (title, fn) in zip(all_tabs[len(tab_names):], custom.items()):
     with tab:
         try:
             items = fn(dict(view=view, mask=mask, weight=w, results=results, labels=labels))

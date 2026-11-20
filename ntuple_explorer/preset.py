@@ -10,9 +10,11 @@ from pathlib import Path
 
 
 def preset_dirs():
-    """Folders searched for presets: NTUPLE_EXPLORER_PRESETS (os.pathsep-separated), then ./presets of the package."""
+    """Folders searched for presets, in order: NTUPLE_EXPLORER_PRESETS (os.pathsep-separated), presets/ at the
+    repository root (git-ignored: local presets), presets/ inside the package."""
     dirs = [Path(d).expanduser() for d in os.environ.get("NTUPLE_EXPLORER_PRESETS", "").split(os.pathsep) if d]
-    dirs.append(Path(__file__).resolve().parent / "presets")
+    here = Path(__file__).resolve().parent
+    dirs += [here.parent / "presets", here / "presets"]
     return [d for d in dirs if d.is_dir()]
 
 
@@ -20,18 +22,20 @@ KEYS = {"name", "description", "files", "tree", "helpers", "prefilter", "columns
         "weight", "controls", "plots", "stack_options", "custom", "postprocess", "plots_2d", "friends", "compositions",
         "colors"}
 NORMS = {"row", "total", "yields"}
+PLACES = {"sidebar", "main"}       # sidebar: selection + cutflow steps; main: page cuts above the tabs
 KINDS = {"alias", "select", "multiselect", "checkboxes", "range", "toggle", "expr"}
 
 
 def discover():
-    """{preset name: file path} of *.py in the preset folders (files starting with _ are helpers, skipped)."""
+    """{preset name: file path} of *.py in the preset folders (files starting with _ are helpers, skipped). On a name
+    clash the first folder wins: the user's folders before the bundled one."""
     out = {}
     for f in [f for d in preset_dirs() for f in sorted(d.glob("*.py"))]:
         if f.name.startswith("_"):
             continue
         try:
             p = load_file(f)
-            out[p["name"]] = f
+            out.setdefault(p["name"], f)
         except Exception as e:      # noqa: BLE001 - listed with the error, app keeps running
             out[f"{f.stem} (error: {type(e).__name__}: {e})"] = None
     return out
@@ -65,6 +69,8 @@ def validate(p, where="preset"):
             raise KeyError(f"{where}: control {i} ({c['kind']}) needs 'column'")
         if c["kind"] in ("alias", "select", "checkboxes") and not c.get("options"):
             raise KeyError(f"{where}: control {i} ({c['kind']}) needs 'options'")
+        if c.get("place", "sidebar") not in PLACES:
+            raise ValueError(f"{where}: control {i} place {c.get('place')!r}, expected one of {sorted(PLACES)}")
     for name in p.get("categories", {}):
         if name in p["columns"]:
             raise KeyError(f"{where}: category {name!r} also defined in columns")

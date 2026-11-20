@@ -4,17 +4,19 @@ Selection controls: spec dict -> Streamlit widget -> boolean mask (or aliases).
 Kinds (spec["kind"]):
   alias       options {label: {target: column | callable(view)}}  - switches which column a name points to
   select      options {label: expr | None}                         - one of several cuts (None = no cut)
-  multiselect column, labels {value: label} (optional), default [values]  - keep the chosen values
+  multiselect column, labels {value: label} (optional), default [values]  - keep the chosen values; two values ->
+              a 3-way switch (all | a | b); on the page (place="main") clickable chips instead of the box
   checkboxes  options {label: expr}, default [labels], combine "or"|"and" - e.g. channels
   range       column, limits (lo, hi) (optional), default (lo, hi), step - slider; at a limit = open-ended
   toggle      expr, default bool, expr_off (optional)                - cut on / off
-  expr        default str                                            - free pandas.eval expression
-Expressions are pandas.eval strings over view columns (& | ~ and or not == < abs) or callables(view) -> bool array.
+  expr        default str                                            - free expression
+Expressions are strings over view columns (View.eval) or callables(view) -> bool array.
 """
 import numpy as np
 import streamlit as st
 
 MAX_CATEGORIES = 20
+ALL = "all"             # first option of the 3-way switch of two-valued columns (no cut)
 
 
 # ----------------------------------------------------------------- column statistics (cached per dataset)
@@ -40,11 +42,13 @@ def stats(view, name, cache):
     return s
 
 
-def auto_spec(view, name, cache):
-    """Control spec for a column from its values (generic mode / extra cuts)."""
+def auto_spec(view, name, cache, labels=None, int_slider=True):
+    """Control spec for a column from its values (generic mode / extra cuts): a multiselect for labelled columns and
+    flags (≤ 2 values), a range slider for numbers; integer-like columns with few values (counts such as n jets) get a
+    slider when int_slider, else a multiselect."""
     s = stats(view, name, cache)
-    if s["kind"] == "cat":
-        return dict(kind="multiselect", column=name, label=name)
+    if s["kind"] == "cat" and (labels or len(s["values"]) <= 2 or not int_slider):
+        return dict(kind="multiselect", column=name, label=name, **({"labels": labels} if labels else {}))
     return dict(kind="range", column=name, label=name)
 
 
@@ -97,8 +101,20 @@ def render(spec, view, key, cache, container=st):
         names = {v: str(labels.get(v, _fmt(v))) for v in values}
         default = spec.get("default")
         default = values if default is None else [v for v in values if v in default or names[v] in default]
-        chosen = container.multiselect(label, values, default=default, format_func=lambda v: names[v], key=key,
-                                       help=help_)
+        if len(values) == 2:
+            # two values (0/1, -1/1, two classes): a 3-way switch  all | first | second. A horizontal radio, not
+            # st.segmented_control: AppTest cannot drive single-choice button groups
+            opts = [ALL] + [names[v] for v in values]
+            pick = container.radio(label, opts, index=opts.index(names[default[0]]) if len(default) == 1 else 0,
+                                   horizontal=True, key=f"{key}__sw", help=help_)
+            chosen = values if pick == ALL else [v for v in values if names[v] == pick]
+        elif spec.get("place") == "main":
+            # on the page: clickable chips (the multiselect box stays in the sidebar)
+            chosen = container.pills(label, values, selection_mode="multi", default=default,
+                                     format_func=lambda v: names[v], key=f"{key}__pills", help=help_) or []
+        else:
+            chosen = container.multiselect(label, values, default=default, format_func=lambda v: names[v], key=key,
+                                           help=help_)
         if len(chosen) < len(values):
             out["mask"] = np.isin(view[col], chosen)
             out["desc"] = f"{col} in [{', '.join(names[v] for v in chosen)}]"

@@ -32,9 +32,11 @@ Then open http://localhost:8501.
 | option | meaning |
 | --- | --- |
 | `--data DIR` | folder whose `.root` files are listed in the app (any other path can be typed in); relative paths in presets are resolved against it |
-| `--presets DIR` | folder with preset files; can be given several times |
+| `--presets DIR` | folder with preset files; can be given several times. On a preset name clash the first folder wins |
 | `--cache DIR` | where the column cache goes (default `<data>/.ntuple_cache`) |
 | `--port N` | port (default 8501) |
+
+Without `--data` / `--presets`, the launcher uses the environment variables `NTUPLE_EXPLORER_DATA` and `NTUPLE_EXPLORER_PRESETS` (several folders separated by `:`), e.g. set once in your shell profile.
 
 The server listens on **localhost only**. The app compiles the ROOT (C++) expressions typed into it, so it must not
 be reachable by other people. `--address` changes this; use it only on a machine and network you trust.
@@ -49,7 +51,7 @@ be reachable by other people. `--address` changes this; use it only on a machine
 
    Raw vectors are never pulled into Python. The result is cached in `.ntuple_cache/`, keyed on file (path, size,
    modification time), tree and expressions. A second load of the same columns takes well under a second.
-2. **Select**: the sidebar controls build boolean masks with numpy; nothing is re-read from disk.
+2. **Select**: the controls build boolean masks with numpy; nothing is re-read from disk (see *Selections* below).
 3. **Plot**: weighted histograms with Plotly.
 
 Unknown branch names are reported as a normal error before anything is compiled: an unknown identifier in a jitted
@@ -59,28 +61,64 @@ RDataFrame expression would otherwise abort the whole Python process.
 
 | tab | content |
 | --- | --- |
-| Plots | 1D histograms: all loaded entries (grey line) vs selected (filled), optional ratio panel (fraction kept per bin), normalisation, log y, stacking by a category. In N-1 mode (default) each plot ignores the cuts on its own variable |
-| 2D | weighted 2D histogram of any two columns |
-| Composition | one category stacked inside the classes of another (e.g. truth origin × reconstruction status): bars at 100 % per row, % of the total or Σw; optional panels split by a third category; extra `where` cut; table + CSV |
-| Cutflow & yields | the controls applied cumulatively in sidebar order (N, Σw, efficiencies) and yields per class of a category; CSV |
+| Plots | 1D histograms of the columns picked in *Variables to plot* (a collapsible box above the tabs): all loaded entries (grey line) vs selected (filled), optional ratio panel (fraction kept per bin), normalisation, log y, stacking by a category. In N-1 mode (default) each plot ignores the cuts on its own variable |
+| 2D | weighted 2D histogram of any two columns: Σw or normalised to the total, per row or per column (e.g. migration-style matrices); optional numbers in each bin (the shown value or the unweighted entries) |
+| Composition | one category stacked inside the classes of another (e.g. truth origin × reconstruction status): bars at 100 % per row, % of the total or Σw; optional panels split by a third category; extra `where` cut; table + CSV. Shown only when the preset defines `compositions` |
+| Cutflow & yields | the controls applied cumulatively in sidebar order: bar chart and table (N, Σw, efficiencies) and yields per class of a category; CSV |
 | custom | any tabs a preset defines |
 
-The sidebar also has **Save / load selection** (all control values as JSON) and **Selection as expression**
-(the active cuts as text).
+The sidebar also has **Save / load selection** (all control values as JSON, page cuts and new columns included) and
+**Selection as expression** (the active cuts as text).
+
+## Selections
+
+There are two kinds of cuts, and every plot, table and header number uses both:
+
+- **Sidebar selection**: the preset controls and *Cuts on any column*. Each control that cuts is one cutflow step, in
+  sidebar order.
+- **Page cuts**: sliders and selectors in the *Page cuts* box above the tabs, for quick looks on top of the
+  selection. Add one with *Add a page cut on*, or mark a preset control `place="main"`. They are not cutflow steps:
+  the cutflow ends with a single *after page cuts* row, and the header says how many entries of the sidebar selection
+  they keep.
+
+**New columns** (sidebar) are computed in memory from loaded columns, without reloading: one `name = expression` per
+line, for example
+
+```text
+lep_ok  = pass_e == 1 || pass_mu == 1     # 0/1 column -> a selector
+nsm_max = max(nsm_a, nsm_b)               # slider at >= 1 = "nsm_a >= 1 or nsm_b >= 1"
+nsm_tot = nsm_a + nsm_b
+```
+
+*Combine columns* writes such lines for you: pick columns and OR / AND (of `column ≠ 0`), max, min, sum or count.
+A new column behaves like a loaded one: sliders and selectors (sidebar or page), plots, stacks, 2D, compositions.
+
+Expressions (new columns, expression cuts, preset `select` / `checkboxes` / `toggle`) accept `+ - * / ** %`,
+comparisons (also chained, `1 < x <= 3`), `& | ~`, `and or not`, `&& || !` (`|` and `&` bind looser than comparisons,
+so `a > 0 | b > 0` is an OR of two conditions), `a if cond else b`, and the functions `max`, `min`,
+`where(cond, a, b)`, `count(cond, ...)` (how many are true), `isin(x, v1, v2, ...)`, `abs`, `sqrt`, `exp`, `log`,
+`log10`, `sin`, `cos`, `tan`, `arctan2`, `hypot`, `floor`, `ceil`. Plain expressions run through numexpr, the
+others through numpy.
 
 ## Generic mode
 
 Pick a file, a tree, scalar branches, vector branches with reducers (element 0/1/2, size, count > 0, sum, max, …),
 extra `name = ROOT expression` columns and an optional pre-filter (applied while reading). Then add a control for
 any loaded column:
-- integer-like columns with ≤ 20 values get a multiselect;
+
+- columns with exactly two values (0/1, −1/1, …) get a 3-way switch *all / a / b*; other columns with labels get a
+  multiselect (clickable chips for page cuts);
+- other integer-like columns with ≤ 20 values (counts such as n jets, n soft muons) get an integer range slider, or a
+  multiselect if you switch "Integer columns with ≤ 20 values as" to *selector* in the same expander;
 - other columns get a range slider (0.1–99.9 % quantiles; a handle left at its limit means "no cut on that side").
 
-The expression cut box takes pandas.eval syntax over loaded columns (`&`, `|`, `~`, `and`, `or`, `==`, `abs()`).
+The expression cut box takes the expressions described in *Selections*.
 
 ## Presets
 
-A preset is a Python file defining `PRESET = dict(...)`. Files whose name starts with `_` are shared helper modules,
+A preset is a Python file defining `PRESET = dict(...)`, in a `--presets` folder or in `presets/` at the repository
+root (git-ignored, for your own analyses; searched after the `--presets` folders). Files whose name starts with `_`
+are shared helper modules,
 not presets. A preset file is re-read on every interaction, so edits apply on the next click. Edits to `_` helper
 modules, and new preset files, need a restart.
 
@@ -134,7 +172,7 @@ PRESET = dict(
 | `controls` | list of control specs (below), rendered in order; later controls see the column choices made by earlier ones |
 | `plots` | `[dict(column, title, bins=(lo, hi, n) or edges, nbins)]` shown by default |
 | `stack_options` | categorical columns offered for stacking |
-| `compositions` | `[dict(rows, segments, norm="row"/"total"/"yields", facet=None, horizontal=True, where=None, title, label_min=6)]`: panels of the Composition tab |
+| `compositions` | `[dict(rows, segments, norm="row"/"total"/"yields", facet=None, horizontal=True, where=None, title, label_min=6)]`: panels of the Composition tab (the tab only appears when this is set) |
 | `colors` | `{column: {class label: colour}}` for stacks and compositions (default: a fixed palette order) |
 | `custom` | `{tab title: f(ctx) -> list}`; `ctx = dict(view, mask, weight, results, labels)`; returned items: plotly figures, DataFrames, markdown strings, `("table", df)`, `("metrics", [(label, value)])` |
 
@@ -144,14 +182,15 @@ Control specs (`kind`):
 | --- | --- | --- |
 | `alias` | `options={label: {name: column or f(view)}}`, `default` | switches which column a name points to (e.g. the weight, or one of several algorithms) |
 | `select` | `options={label: expression or None}`, `default` | one of several cuts |
-| `multiselect` | `column`, `labels`, `default=[values]` | keep the chosen values |
+| `multiselect` | `column`, `labels`, `default=[values]` | keep the chosen values: a multiselect box in the sidebar, clickable chips on the page (`place="main"`); a column with exactly two values (0/1, −1/1, two classes) gets a 3-way switch *all / a / b* instead, in both places |
 | `checkboxes` | `options={label: expression}`, `default=[labels]`, `combine="or"/"and"` | e.g. lepton channels |
 | `range` | `column`, `limits=(lo, hi)`, `default=(lo, hi)`, `step` | slider; a handle at a limit = open-ended |
 | `toggle` | `expr`, `default`, `expr_off` | cut on/off |
 | `expr` | `default` | free cut expression |
 
-Common optional fields: `label`, `help`, `dropdown=True` (selectbox instead of radio).
-Expressions in controls are pandas.eval strings over view columns, or `f(view) -> bool array`.
+Common optional fields: `label`, `help`, `dropdown=True` (selectbox instead of radio), `place="main"` (a page cut
+above the tabs instead of a sidebar cut; see *Selections*).
+Expressions in controls are strings over view columns (syntax in *Selections*), or `f(view) -> bool array`.
 
 ## Notes
 
@@ -159,4 +198,5 @@ Expressions in controls are pandas.eval strings over view columns, or `f(view) -
 - `Clear cache` in the sidebar deletes the cache folder. Cached columns are also invalidated automatically when
   the ROOT file changes.
 - Tables are rendered as HTML, so they work even where pyarrow is broken.
-- `Max entries` in the sidebar reads only the first N entries, for quick looks at huge files.
+- `Max entries` in the sidebar reads only the first N entries, for quick looks at huge files (-1, the default,
+  reads all).

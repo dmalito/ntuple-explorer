@@ -12,6 +12,9 @@ OTHER = "#9a9892"
 REFERENCE = "#8a8984"        # "before selection" outline
 SELECTED = SERIES[0]
 SEQUENTIAL = [[0, "#cde2fb"], [0.25, "#86b6ef"], [0.5, "#3987e5"], [0.75, "#1c5cab"], [1, "#0d366b"]]
+# legend as a column right of the plot area (plotly widens the right margin for it): long or wrapped legends
+# never run into the title
+LEGEND_RIGHT = dict(orientation="v", yanchor="top", y=1, xanchor="left", x=1.01, font=dict(size=11))
 
 
 def _sum(w, m=None):
@@ -249,8 +252,7 @@ def hist1d(x, w, base_mask, sel_mask, binspec, title, xlabel=None, normalise=Fal
         fig.update_xaxes(type="category", categoryorder="array", categoryarray=binspec[2])
     fig.update_layout(title=dict(text=title, x=0, font=dict(size=14)), height=380 if ratio else 300,
                       margin=dict(l=10, r=10, t=40, b=10), bargap=0.03 if binspec[0] == "num" else 0.25,
-                      legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="right", x=1, font=dict(size=11)),
-                      hovermode="closest")
+                      legend=LEGEND_RIGHT, hovermode="closest")
     return fig
 
 
@@ -381,9 +383,8 @@ def composition(rows, row_names, segs, seg_names, w, mask, norm="row", horizonta
     nrow = len(rlabels)
     height = max(260, 30 * nrow + 150) if horizontal else 440
     fig.update_layout(barmode="stack", bargap=0.28, height=height, title=dict(text=title, x=0, font=dict(size=14)),
-                      margin=dict(l=10, r=10, t=95, b=10), uniformtext=dict(minsize=9, mode="hide"),
-                      legend=dict(orientation="h", yanchor="bottom", y=1.04, xanchor="left", x=0, font=dict(size=11),
-                                  title_text=legend_title or ""),
+                      margin=dict(l=10, r=10, t=70 if npan > 1 else 45, b=10), uniformtext=dict(minsize=9, mode="hide"),
+                      legend=dict(LEGEND_RIGHT, title_text=legend_title or ""),
                       hovermode="closest")
     if npan > 1:
         fig.update_annotations(font_size=12)
@@ -392,12 +393,17 @@ def composition(rows, row_names, segs, seg_names, w, mask, norm="row", horizonta
 
 
 # ----------------------------------------------------------------- 2D
-def hist2d(x, y, w, mask, bx, by, xlabel, ylabel, logz=False):
+NORMS_2D = {"none": "Σw", "total": "% of total", "row": "% of row (each y bin)", "column": "% of column (each x bin)"}
+
+
+def hist2d(x, y, w, mask, bx, by, xlabel, ylabel, logz=False, norm="none", text=None):
+    """Weighted 2D histogram. norm: "none" (Σw), "total", "row" (each y bin adds up to 100 %), "column" (each x bin
+    adds up to 100 %). text: None, "value" (the coloured quantity) or "entries" (unweighted N) written in each bin."""
     if bx[0] == "cat":
         bx = _order_for_cat(bx)
     if by[0] == "cat":
         by = _order_for_cat(by)
-    xs, ys, ws = x[mask], y[mask], w[mask].astype(np.float64)
+    xs, ys, ws = x[mask], y[mask], np.asarray(w)[mask].astype(np.float64)
 
     def idx(v, b):
         i, ok, n = bin_index(v, b)
@@ -406,12 +412,27 @@ def hist2d(x, y, w, mask, bx, by, xlabel, ylabel, logz=False):
     ix, okx, nx, cx = idx(xs, bx)
     iy, oky, ny, cy = idx(ys, by)
     ok = okx & oky
-    h = np.bincount(iy[ok] * nx + ix[ok], weights=ws[ok], minlength=nx * ny)[:nx * ny].reshape(ny, nx)
-    z = np.log10(np.where(h > 0, h, np.nan)) if logz else h
-    fig = go.Figure(go.Heatmap(x=cx, y=cy, z=z, colorscale=SEQUENTIAL, customdata=h,
-                               colorbar=dict(title="log10 Σw" if logz else "Σw"),
-                               hovertemplate=f"{xlabel}: %{{x}}<br>{ylabel}: %{{y}}<br>Σw: %{{customdata:.4g}}"
-                                             "<extra></extra>"))
+    flat = iy[ok] * nx + ix[ok]
+    h = np.bincount(flat, weights=ws[ok], minlength=nx * ny)[:nx * ny].reshape(ny, nx)
+    nh = np.bincount(flat, minlength=nx * ny)[:nx * ny].reshape(ny, nx)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        tot = {"none": 1.0, "total": h.sum() / 100, "row": h.sum(1, keepdims=True) / 100,
+               "column": h.sum(0, keepdims=True) / 100}[norm]
+        v = np.where(nh > 0, h / tot, np.nan) if norm != "none" else h
+    z = np.log10(np.where(v > 0, v, np.nan)) if logz else v
+    ztitle = NORMS_2D[norm].split(" (")[0]
+    hm = dict(x=cx, y=cy, z=z, colorscale=SEQUENTIAL, customdata=np.dstack([v, h, nh]),
+              colorbar=dict(title=f"log10 {ztitle}" if logz else ztitle),
+              hovertemplate=(f"{xlabel}: %{{x}}<br>{ylabel}: %{{y}}<br>"
+                             + (f"{ztitle}: %{{customdata[0]:.3g}}<br>" if norm != "none" else "")
+                             + "Σw: %{customdata[1]:.4g}<br>N: %{customdata[2]:,.0f}<extra></extra>"))
+    if text:
+        if text == "entries":
+            lab = np.where(nh > 0, np.char.mod("%d", nh), "")
+        else:
+            lab = np.where(nh > 0, np.char.mod("%.1f" if norm != "none" else "%.4g", np.nan_to_num(v)), "")
+        hm.update(text=lab, texttemplate="%{text}", textfont=dict(size=10))
+    fig = go.Figure(go.Heatmap(**hm))
     fig.update_layout(height=520, margin=dict(l=10, r=10, t=30, b=10), xaxis_title=xlabel, yaxis_title=ylabel)
     if bx[0] == "cat":
         fig.update_xaxes(type="category")
@@ -421,8 +442,12 @@ def hist2d(x, y, w, mask, bx, by, xlabel, ylabel, logz=False):
 
 
 # ----------------------------------------------------------------- tables
-def cutflow(results, w, base_mask=None):
-    """Cumulative cutflow over the controls that cut, in sidebar order."""
+PAGE_STEP = "after page cuts"
+
+
+def cutflow(results, w, base_mask=None, page=()):
+    """Cumulative cutflow over the controls that cut, in sidebar order; the page cuts (results too), if any cut,
+    add one last row PAGE_STEP."""
     n0 = len(w) if base_mask is None else int(base_mask.sum())
     m = base_mask
     sw0 = _sum(w, m)[0]
@@ -436,7 +461,36 @@ def cutflow(results, w, base_mask=None):
         rows.append(dict(step=r["label"], cut=r["desc"] or "", N=int(m.sum()), sumw=sw, err=np.sqrt(sw2),
                          eff_step=sw / prev if prev else np.nan, eff_total=sw / sw0 if sw0 else np.nan))
         prev = sw
+    page = [r for r in page if r["mask"] is not None]
+    if page:
+        for r in page:
+            m = r["mask"] if m is None else (m & r["mask"])
+        sw, sw2 = _sum(w, m)
+        rows.append(dict(step=PAGE_STEP, cut=" && ".join(r["desc"] or f"[{r['label']}]" for r in page), N=int(m.sum()),
+                         sumw=sw, err=np.sqrt(sw2), eff_step=sw / prev if prev else np.nan,
+                         eff_total=sw / sw0 if sw0 else np.nan))
     return pd.DataFrame(rows)
+
+
+def cutflow_fig(cf, logx=False):
+    """Horizontal bars of the cutflow table (Σw per step, statistical error), cumulative efficiency written on each
+    bar; the "loaded" bar in the reference grey, the page-cuts bar in the second series colour."""
+    steps = [f"{i}. {s}" if i and s != PAGE_STEP else str(s) for i, s in enumerate(cf["step"])]
+    pct = [f"{100 * e:.3g}%" for e in cf["eff_total"]]
+    fig = go.Figure(go.Bar(
+        x=cf["sumw"], y=steps, orientation="h", error_x=dict(type="data", array=cf["err"], thickness=1, width=0),
+        marker_color=[REFERENCE if i == 0 else SERIES[1] if s == PAGE_STEP else SELECTED for i, s in enumerate(cf["step"])],
+        text=pct, textposition="outside",
+        customdata=np.c_[cf["N"], cf["eff_step"], cf["eff_total"], cf["cut"]],
+        hovertemplate=("<b>%{y}</b><br>%{customdata[3]}<br>Σw %{x:.5g} · N %{customdata[0]:,.0f}<br>"
+                       "step eff. %{customdata[1]:.4f} · total eff. %{customdata[2]:.4f}<extra></extra>")))
+    fig.update_yaxes(type="category", categoryorder="array", categoryarray=steps, autorange="reversed",
+                     showgrid=False)
+    fig.update_xaxes(title_text="Σw", type="log" if logx else "linear", gridcolor="rgba(128,128,128,0.15)",
+                     zeroline=False, **({} if logx else {"range": [0, 1.15 * float(cf["sumw"].max() or 1)]}))
+    fig.update_layout(height=max(220, 34 * len(cf) + 90), margin=dict(l=10, r=10, t=30, b=10), bargap=0.3,
+                      showlegend=False, hovermode="closest")
+    return fig
 
 
 def yields_by(codes, names, w, mask):

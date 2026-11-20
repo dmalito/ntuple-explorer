@@ -4,7 +4,9 @@ Launch the app:
     python -m ntuple_explorer --data DIR [--presets DIR ...] [--port 8501]
 
 --data     folder whose .root files are listed in the app; relative paths in presets are resolved against it
+           (default: $NTUPLE_EXPLORER_DATA, else the current directory)
 --presets  folder(s) with preset files (*.py defining PRESET = dict(...)); may be given several times
+           (default: $NTUPLE_EXPLORER_PRESETS, os.pathsep-separated)
 --cache    where the column cache is written (default: <data>/.ntuple_cache)
 
 The server listens on localhost only: the app compiles C++ typed into its text boxes (ROOT expressions), so it must
@@ -20,8 +22,9 @@ from pathlib import Path
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="python -m ntuple_explorer", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--data", default=".", help="folder with the ROOT files (default: current directory)")
-    ap.add_argument("--presets", action="append", default=[], help="folder with preset files (repeatable)")
+    ap.add_argument("--data", default=os.environ.get("NTUPLE_EXPLORER_DATA", "."),
+                    help="folder with the ROOT files (default: $NTUPLE_EXPLORER_DATA, else the current directory)")
+    ap.add_argument("--presets", action="append", default=[], help="folder with preset files (repeatable; default: $NTUPLE_EXPLORER_PRESETS)")
     ap.add_argument("--cache", help="cache folder (default: <data>/.ntuple_cache)")
     ap.add_argument("--port", type=int, default=8501)
     ap.add_argument("--address", default="localhost", help="address to listen on (default: localhost only)")
