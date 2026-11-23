@@ -335,6 +335,80 @@ def join_friend(main, path, spec, columns, helpers=DEFAULT_HELPERS, drop_missing
     return res
 
 
+def _fill_for(a, fills, name):
+    """(fill value, dtype) for rows without a value: NaN for floats; else `fills` (int, or {column: int}, default -1)
+    with a wider integer type when the fill does not fit (e.g. -1 in an unsigned column)."""
+    if a.dtype.kind == "f":
+        return np.nan, a.dtype
+    fill = fills.get(name, -1) if isinstance(fills, dict) else fills
+    dt = a.dtype if a.dtype.kind != "b" else np.dtype(np.int8)
+    if dt.kind in "iu" and not (np.iinfo(dt).min <= fill <= np.iinfo(dt).max):
+        dt = np.dtype(np.int64) if dt.itemsize >= 4 else np.dtype(np.int32)
+    return fill, dt
+
+
+def join_level(main, path, spec, columns, helpers=DEFAULT_HELPERS, drop_missing=True, main_name="reco"):
+    """Outer join of a second tree (another level, e.g. truth) with the main tree on event keys: one row per event in
+    either tree. Rows: the main tree's rows in their order, then the events found only in the second tree.
+
+    spec: dict(tree, name="truth", keys=["runNumber", "eventNumber"], prefilter=None, fill=-1 or {column: fill})
+    columns: {name: ROOT expression} on the second tree; names must differ from the main columns.
+    Adds the int8 flags in_<main_name> / in_<name> (event present in that tree, after its prefilter). A level's
+    columns are NaN (floats) or `fill` on rows of events missing from that level. Duplicated keys in the second tree:
+    the first entry is matched, the others become events of that level only.
+    attrs: levels [main_name, name], level_of {column: level}, n_both, dropped (second tree's, prefixed name:)."""
+    name = spec.get("name", "truth")
+    keys = list(spec.get("keys", ["runNumber", "eventNumber"]))
+    miss = [k for k in keys if k not in main.columns]
+    if miss:
+        raise KeyError(f"matching {spec['tree']}: key column(s) {miss} not loaded in the main tree")
+    cols = {k: k for k in keys}
+    cols.update(columns)
+    sec = load(path, spec["tree"], cols, entries=spec.get("entries") or None, prefilter=spec.get("prefilter"),
+               helpers=helpers, drop_missing=drop_missing)
+    miss = [k for k in keys if k not in sec.columns]
+    if miss:
+        raise KeyError(f"matching {spec['tree']}: key branch(es) {miss} missing")
+    flags = {main_name: f"in_{main_name}", name: f"in_{name}"}
+    clash = ((set(sec.columns) - set(keys)) & set(main.columns)) | (set(flags.values()) & (set(main) | set(sec)))
+    if clash:
+        raise KeyError(f"matching {spec['tree']}: column names {sorted(clash)} used by both levels (rename them)")
+    idx = match_index([main[k].to_numpy() for k in keys], [sec[k].to_numpy() for k in keys])
+    has = idx >= 0
+    used = np.zeros(len(sec), bool)
+    used[idx[has]] = True
+    only = np.flatnonzero(~used)
+    n_main, n_only = len(main), len(only)
+    fills = spec.get("fill", -1)
+    out, level_of = {}, {}
+    for k in keys:
+        a, b = main[k].to_numpy(), sec[k].to_numpy()[only]
+        out[k] = np.concatenate([a, b]).astype(np.result_type(a, b), copy=False)
+    for c in main.columns:
+        if c in keys:
+            continue
+        a = main[c].to_numpy()
+        fill, dt = _fill_for(a, fills, c)
+        out[c] = np.concatenate([a.astype(dt, copy=False), np.full(n_only, fill, dt)])
+        level_of[c] = main_name
+    for c in sec.columns:
+        if c in keys:
+            continue
+        a = sec[c].to_numpy()
+        fill, dt = _fill_for(a, fills, c)
+        part = np.full(n_main, fill, dt)
+        part[has] = a[idx[has]]
+        out[c] = np.concatenate([part, a[only].astype(dt, copy=False)])
+        level_of[c] = name
+    out[flags[main_name]] = np.r_[np.ones(n_main, np.int8), np.zeros(n_only, np.int8)]
+    out[flags[name]] = np.r_[has.astype(np.int8), np.ones(n_only, np.int8)]
+    res = pd.DataFrame(out)
+    res.attrs.update(levels=[main_name, name], level_of=level_of, n_both=int(has.sum()), keys=keys,
+                     dropped={**main.attrs.get("dropped", {}),
+                              **{f"{name}:{k}": v for k, v in sec.attrs.get("dropped", {}).items()}})
+    return res
+
+
 def clear_cache():
     n = 0
     if CACHE_DIR.exists():
@@ -404,5 +478,6 @@ def nth_columns(spec):
     """{column name: ROOT expression}: the k-th largest per-object value, k = 0 .. max_n - 1 (NaN if fewer objects).
     Names start with __ (hidden from column lists) and depend only on the values / where expressions."""
     v = nth_values(spec)
-    tag = re.sub(r"\W+", "_", v).strip("_")[:40] + "_" + hashlib.sha1(v.encode()).hexdigest()[:6]
+    h = v + (f"|{spec['level']}" if spec.get("level") else "")      # second level: own names (same branch names)
+    tag = re.sub(r"\W+", "_", v).strip("_")[:40] + "_" + hashlib.sha1(h.encode()).hexdigest()[:6]
     return {f"__nth_{tag}_{k}": f"nx_kth({v}, {k})" for k in range(int(spec.get("max_n", NTH_MAX)))}

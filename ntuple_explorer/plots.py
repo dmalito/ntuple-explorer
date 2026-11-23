@@ -75,6 +75,13 @@ def bin_index(x, binspec, overflow=True):
     e = np.asarray(binspec[1], dtype=float)
     n = len(e) - 1
     xf = x.astype(np.float64, copy=False)
+    fin = None
+    if x.dtype.kind == "f":
+        fin = np.isfinite(xf)
+        if fin.all():
+            fin = None
+        else:                   # NaN (e.g. an event missing from this level): never in a bin
+            xf = np.where(fin, xf, e[0] - 1.0)
     if overflow:
         xf = np.clip(xf, e[0], np.nextafter(e[-1], -np.inf))
     d = np.diff(e)
@@ -85,7 +92,9 @@ def bin_index(x, binspec, overflow=True):
         idx = np.searchsorted(e, xf, side="right") - 1
     ok = (idx >= 0) & (idx < n)
     if not overflow:
-        ok &= np.isfinite(xf) & (xf <= e[-1])
+        ok &= xf <= e[-1]
+    if fin is not None:
+        ok &= fin
     return idx, ok, n
 
 
@@ -145,7 +154,7 @@ def hist1d(x, w, base_mask, sel_mask, binspec, title, xlabel=None, normalise=Fal
     selected events (stack = (codes array, {code: name})) and a selected / before ratio panel.
 
     w: weight array or the (w64, w2) tuple of weights(). base_key: hashable description of (data, column, weight,
-    binning) under which the "before" histogram is cached across reruns (it does not depend on the cuts)."""
+    base_mask) under which the "before" histogram is cached across reruns (it must not depend on the cuts)."""
     if binspec[0] == "cat":
         binspec = _order_for_cat(binspec)
     rows = 2 if ratio else 1
@@ -163,7 +172,7 @@ def hist1d(x, w, base_mask, sel_mask, binspec, title, xlabel=None, normalise=Fal
         i = idx[k]
         return (np.bincount(i, weights=w64[k], minlength=n)[:n], np.bincount(i, weights=w2[k], minlength=n)[:n])
 
-    bk = (base_key, repr(binspec), overflow) if base_key is not None and base_mask is None else None
+    bk = (base_key, repr(binspec), overflow) if base_key is not None else None
     if bk is not None and bk in _BASE_CACHE:
         hb, hb2 = _BASE_CACHE[bk]
         _BASE_CACHE.move_to_end(bk)
@@ -397,9 +406,10 @@ def composition(rows, row_names, segs, seg_names, w, mask, norm="row", horizonta
 NORMS_2D = {"none": "Σw", "total": "% of total", "row": "% of row (each y bin)", "column": "% of column (each x bin)"}
 
 
-def hist2d(x, y, w, mask, bx, by, xlabel, ylabel, logz=False, norm="none", text=None):
+def hist2d(x, y, w, mask, bx, by, xlabel, ylabel, logz=False, norm="none", text=None, overflow=True):
     """Weighted 2D histogram. norm: "none" (Σw), "total", "row" (each y bin adds up to 100 %), "column" (each x bin
-    adds up to 100 %). text: None, "value" (the coloured quantity) or "entries" (unweighted N) written in each bin."""
+    adds up to 100 %). text: None, "value" (the coloured quantity) or "entries" (unweighted N) written in each bin.
+    overflow: values outside the binning go to the edge bins (else they are left out)."""
     if bx[0] == "cat":
         bx = _order_for_cat(bx)
     if by[0] == "cat":
@@ -407,7 +417,7 @@ def hist2d(x, y, w, mask, bx, by, xlabel, ylabel, logz=False, norm="none", text=
     xs, ys, ws = x[mask], y[mask], np.asarray(w)[mask].astype(np.float64)
 
     def idx(v, b):
-        i, ok, n = bin_index(v, b)
+        i, ok, n = bin_index(v, b, overflow)
         return i, ok, n, (b[2] if b[0] == "cat" else 0.5 * (np.asarray(b[1])[1:] + np.asarray(b[1])[:-1]))
 
     ix, okx, nx, cx = idx(xs, bx)
@@ -439,6 +449,60 @@ def hist2d(x, y, w, mask, bx, by, xlabel, ylabel, logz=False, norm="none", text=
         fig.update_xaxes(type="category")
     if by[0] == "cat":
         fig.update_yaxes(type="category")
+    return fig
+
+
+# ----------------------------------------------------------------- unfolding
+def bin_labels(binspec):
+    """Display label of each bin: class names, or [lo, hi) for edges."""
+    if binspec[0] == "cat":
+        return [str(x) for x in binspec[2]]
+    e = np.asarray(binspec[1], dtype=float)
+    return [f"[{a:g}, {b:g})" for a, b in zip(e[:-1], e[1:])]
+
+
+def unfolding(xr, xt, w_mig, w_r, w_t, sel_r, sel_t, binspec, overflow=False):
+    """Unfolding ingredients of one variable (reco values xr, truth values xt, same binning). Matched = sel_r & sel_t.
+    M[i, j] = Σ w_mig of matched entries in truth bin i and reco bin j; N_reco_j = Σ w_r of reco-selected entries in
+    reco bin j; N_truth_i = Σ w_t of truth-selected entries in truth bin i.
+    acceptance_j = Σ_i M[i, j] / N_reco_j, efficiency_i = Σ_j M[i, j] / N_truth_i, purity_j = M[j, j] / Σ_i M[i, j],
+    stability_i = M[i, i] / Σ_j M[i, j]. Values outside the binning are left out (overflow=False: they count as
+    migrations out of range) or go to the edge bins. -> (M, unweighted counts of M, table DataFrame)."""
+    if binspec[0] == "cat":
+        binspec = _order_for_cat(binspec)
+    ir, okr, n = bin_index(xr, binspec, overflow)
+    it, okt, _ = bin_index(xt, binspec, overflow)
+    w_mig, w_r, w_t = (np.asarray(a, dtype=np.float64) for a in (w_mig, w_r, w_t))
+    k = sel_r & sel_t & okr & okt
+    flat = it[k] * n + ir[k]
+    M = np.bincount(flat, weights=w_mig[k], minlength=n * n)[:n * n].reshape(n, n)
+    C = np.bincount(flat, minlength=n * n)[:n * n].reshape(n, n)
+    kr, kt = sel_r & okr, sel_t & okt
+    Nr = np.bincount(ir[kr], weights=w_r[kr], minlength=n)[:n]
+    Nt = np.bincount(it[kt], weights=w_t[kt], minlength=n)[:n]
+    col, row, d = M.sum(0), M.sum(1), np.diag(M)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        table = pd.DataFrame(dict(
+            bin=bin_labels(binspec), N_reco=np.bincount(ir[kr], minlength=n)[:n],
+            N_truth=np.bincount(it[kt], minlength=n)[:n], N_matched_reco=C.sum(0), N_matched_truth=C.sum(1),
+            sumw_reco=Nr, sumw_truth=Nt, matched_reco=col, matched_truth=row,
+            acceptance=col / Nr, efficiency=row / Nt, purity=d / col, stability=d / row))
+    return M, C, table
+
+
+def unfolding_fig(table, title=""):
+    """Acceptance (per reco bin), efficiency (per truth bin), purity and stability vs bin."""
+    fig = go.Figure()
+    for j, (c, lab) in enumerate([("acceptance", "acceptance (per reco bin)"),
+                                  ("efficiency", "efficiency (per truth bin)"),
+                                  ("purity", "purity"), ("stability", "stability")]):
+        fig.add_trace(go.Scatter(x=table["bin"], y=table[c], mode="lines+markers", name=lab,
+                                 line=dict(color=SERIES[j], width=2, dash="solid" if j < 2 else "dot"),
+                                 marker=dict(size=7), hovertemplate="%{x}<br>" + c + ": %{y:.4f}<extra></extra>"))
+    fig.update_xaxes(type="category", title_text="bin", showgrid=False)
+    fig.update_yaxes(range=[0, 1.05], title_text="fraction", gridcolor="rgba(128,128,128,0.15)", zeroline=False)
+    fig.update_layout(title=dict(text=title, x=0, font=dict(size=14)), height=360, legend=LEGEND_RIGHT,
+                      margin=dict(l=10, r=10, t=40, b=10), hovermode="x unified")
     return fig
 
 

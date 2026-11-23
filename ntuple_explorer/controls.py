@@ -29,9 +29,14 @@ SNAP = 0.05
 
 # ----------------------------------------------------------------- column statistics (cached per dataset)
 def stats(view, name, cache):
+    """Column summary (kind cat / num, values or quantiles, min / max), cached in `cache`. A cache with a
+    rows(name) method restricts it to those rows (e.g. a matched dataset: only the events of the column's level)."""
     if name in cache:
         return cache[name]
     a = view[name]
+    rows = cache.rows(name) if hasattr(cache, "rows") else None
+    if rows is not None:
+        a = a[rows]
     s = dict(dtype=a.dtype.kind)
     finite = a[np.isfinite(a)] if a.dtype.kind == "f" else a
     if a.dtype.kind in "biu" or (a.dtype.kind == "f" and len(finite) and np.all(np.mod(finite[:100000], 1) == 0)):

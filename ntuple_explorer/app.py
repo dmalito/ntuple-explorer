@@ -5,6 +5,8 @@ Ntuple Explorer - interactive selections and plots on ROOT ntuples.
 """
 import hashlib
 import json
+import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -29,7 +31,8 @@ GENERIC = "Generic (any tree / branch)"
 
 # ----------------------------------------------------------------- cached work
 @st.cache_resource(show_spinner=False, max_entries=6)
-def cached_load(path, tree, columns_items, entries, prefilter, helpers, drop_missing, friends=()):
+def cached_load(path, tree, columns_items, entries, prefilter, helpers, drop_missing, friends=(), match=""):
+    """Main tree + friend columns (left join) + optionally a second level (outer join, `match`: JSON spec)."""
     df = loader.load(path, tree, dict(columns_items), entries=entries or None, prefilter=prefilter or None,
                      helpers=helpers, drop_missing=drop_missing)
     dropped, errors, parts = dict(df.attrs.get("dropped", {})), {}, [df]
@@ -45,6 +48,11 @@ def cached_load(path, tree, columns_items, entries, prefilter, helpers, drop_mis
     if len(parts) > 1:
         df = pd.concat(parts, axis=1, copy=False)
     df.attrs.update(dropped=dropped, friend_errors=errors)
+    if match:
+        spec = json.loads(match)
+        df = loader.join_level(df, path, spec, dict(spec["columns"]), helpers=helpers, drop_missing=drop_missing,
+                               main_name=spec.get("main", "reco"))
+        df.attrs["friend_errors"] = errors
     return df
 
 
@@ -112,7 +120,33 @@ if mode != GENERIC:
     if P.get("description"):
         st.sidebar.caption(P["description"])
 
+VTAG = {"number": "", "lorentz": "  (4-vector)", "object": "  (objects: size only)"}
+
+
+def atl_generic(branch, kind, level=None):
+    """Generic-mode at_least spec for a vector branch (pt of 4-vectors), optionally on the second level."""
+    s = dict(kind="at_least", label=f"{level}: {branch}" if level else branch,
+             **({"vector": branch} if kind == "lorentz" else {"values": branch}))
+    return dict(s, level=level) if level else s
+
+
+def generic_columns(scalars, vectors, reds, comps, extra, atl):
+    """{name: ROOT expression} of one tree in generic mode: scalar branches, reduced vectors ((branch, kind) pairs),
+    extra `name = expression` lines and the k-th largest columns of the at_least specs."""
+    cols = {b: b for b in scalars}
+    for b, k in vectors:
+        cols.update(loader.vector_columns(b, k, reds, comps))
+    for s_ in atl:
+        cols.update(loader.nth_columns(s_))
+    for line in extra.splitlines():
+        if "=" in line and line.split("=", 1)[0].strip().isidentifier():
+            n, e = line.split("=", 1)
+            cols[n.strip()] = e.strip()
+    return cols
+
+
 atl_specs = []          # generic mode: "at least N above X" cuts on vector branches (presets: at_least controls)
+match_gen, match_req = None, None       # second level (generic settings / load request)
 with st.sidebar.expander("Data", expanded="active" not in st.session_state):
     files = dict(P["files"]) if P and P.get("files") else {f: f for f in root_files()}
     files = {k: v for k, v in files.items() if loader.resolve(v).exists()} or files
@@ -134,6 +168,11 @@ with st.sidebar.expander("Data", expanded="active" not in st.session_state):
                        f"matched on {', '.join(f.get('keys', ['runNumber', 'eventNumber']))}")
         prefilter = P.get("prefilter")
         helpers = P.get("helpers") or loader.DEFAULT_HELPERS
+        if P.get("match"):
+            match_req = pre.match_request(P)
+            st.caption(f"+ matched with **{match_req['tree']}** (level *{match_req['name']}*, this tree: "
+                       f"*{match_req['main']}*) on {', '.join(match_req['keys'])}: {len(match_req['columns'])} "
+                       "columns")
     else:
         tlist = cached_trees(path, mtime(path))
         tree = st.selectbox("Tree", tlist, key="g_tree")
@@ -143,24 +182,17 @@ with st.sidebar.expander("Data", expanded="active" not in st.session_state):
         num = info.element == "number"
         scal = info.loc[~info.is_vector & num, "branch"].tolist()
         vec = info.loc[info.is_vector, "branch"].tolist()
-        vtag = {"number": "", "lorentz": "  (4-vector)", "object": "  (objects: size only)"}
         sel_s = st.multiselect("Scalar branches", scal, key="g_scal")
-        sel_v = st.multiselect("Vector branches", vec, key="g_vec", format_func=lambda b: b + vtag[kinds[b]])
+        sel_v = st.multiselect("Vector branches", vec, key="g_vec", format_func=lambda b: b + VTAG[kinds[b]])
         reds = st.multiselect("…reduced as", list(loader.REDUCERS), default=["element 0 (leading)"], key="g_red",
                               help="each vector branch becomes one column per reducer; for 4-vectors, element i "
-                                   "gives the components below, sum / max / min act on pt, counts do not apply")
-        comps = ["pt"]
-        if any(kinds[b] == "lorentz" for b in sel_v):
-            comps = st.multiselect("…4-vector components", loader.COMPONENTS, default=["pt"], key="g_comp",
-                                   help="of each chosen element (units as stored, e.g. MeV)")
-        atl_opts = [b for b in vec if kinds[b] in ("number", "lorentz")]
-        atl = st.multiselect("'At least N above X' cuts on", atl_opts, key="g_atl",
-                             format_func=lambda b: b + vtag[kinds[b]],
+                                   "gives the components chosen below, sum / max / min act on pt, counts do not "
+                                   "apply. Also used for the second tree.")
+        atl = st.multiselect("'At least N above X' cuts on", [b for b in vec if kinds[b] in ("number", "lorentz")],
+                             key="g_atl", format_func=lambda b: b + VTAG[kinds[b]],
                              help=f"loads the 1st … {loader.NTH_MAX}th largest value per entry (pt for 4-vectors); "
-                                  "the "
-                                  "cut then picks N and the threshold X interactively")
-        atl_specs = [dict(kind="at_least", label=b, **({"vector": b} if kinds[b] == "lorentz" else {"values": b}))
-                     for b in atl]
+                                  "the cut then picks N and the threshold X interactively")
+        atl_specs = [atl_generic(b, kinds[b]) for b in atl]
         other = info.loc[~info.is_vector & ~num, "branch"].tolist()
         if other:
             st.caption("Not listed (single objects): " + ", ".join(f"`{b}`" for b in other)
@@ -168,16 +200,62 @@ with st.sidebar.expander("Data", expanded="active" not in st.session_state):
         extra = st.text_area("Extra columns (`name = ROOT expression`, one per line)", key="g_extra",
                              placeholder="nbtag = Sum(jet_btag == 1)\nlead_pt = nx_pt(jet_p4, 0)")
         prefilter = st.text_input("Pre-filter (ROOT expression, applied while reading)", key="g_pref")
-        columns = {b: b for b in sel_s}
-        for b in sel_v:
-            columns.update(loader.vector_columns(b, kinds[b], reds, comps))
-        for s_ in atl_specs:
-            columns.update(loader.nth_columns(s_))
-        for line in extra.splitlines():
-            if "=" in line and line.split("=", 1)[0].strip().isidentifier():
-                n, e = line.split("=", 1)
-                columns[n.strip()] = e.strip()
         helpers = loader.DEFAULT_HELPERS
+
+        # ---- second level: another tree of the file, events matched on keys (outer join)
+        vec_any = [(b, kinds[b]) for b in sel_v]
+        if st.toggle("Match events with a second tree", key="g_match",
+                     help="e.g. reco ↔ truth: events of both trees joined on keys such as runNumber, eventNumber; "
+                          "each level keeps its own selection and weight; enables the Unfolding tab"):
+            others = [x for x in tlist if x != tree]
+            if not others:
+                st.caption("No other tree in this file.")
+            else:
+                tree2 = st.selectbox("Second tree", others, key="g_m_tree")
+                info2 = cached_branch_info(path, tree2, mtime(path))
+                kinds2 = dict(zip(info2.branch, info2.element))
+                num2 = info2.element == "number"
+                scal2 = set(info2.loc[~info2.is_vector & num2, "branch"])
+                common = [b for b in scal if b in scal2]
+                mkeys = st.multiselect("Match on", common, key="g_m_keys",
+                                       default=[k for k in ("runNumber", "eventNumber") if k in common])
+                n1, n2 = st.columns(2)
+                lv1 = n1.text_input("Level name, this tree", "reco", key="g_m_main").strip()
+                lv2 = n2.text_input("Level name, second tree", "truth", key="g_m_name").strip()
+                vec2 = info2.loc[info2.is_vector, "branch"].tolist()
+                sel_s2 = st.multiselect(f"{lv2}: scalar branches", sorted(scal2), key="g_m_scal")
+                sel_v2 = st.multiselect(f"{lv2}: vector branches", vec2, key="g_m_vec",
+                                        format_func=lambda b: b + VTAG[kinds2[b]])
+                atl2 = st.multiselect(f"{lv2}: 'at least N above X' cuts on",
+                                      [b for b in vec2 if kinds2[b] in ("number", "lorentz")], key="g_m_atl",
+                                      format_func=lambda b: b + VTAG[kinds2[b]])
+                extra2 = st.text_area(f"{lv2}: extra columns", key="g_m_extra")
+                pref2 = st.text_input(f"{lv2}: pre-filter", key="g_m_pref")
+                vec_any += [(b, kinds2[b]) for b in sel_v2]
+                if not (lv1.isidentifier() and lv2.isidentifier() and lv1 != lv2):
+                    st.error("Level names must be two different identifiers (letters, digits, _).")
+                elif not mkeys:
+                    st.error("Choose the branches to match on.")
+                else:
+                    atl_specs += [atl_generic(b, kinds2[b], lv2) for b in atl2]
+                    match_gen = dict(tree=tree2, name=lv2, main=lv1, keys=mkeys, prefilter=pref2 or None,
+                                     scal=sel_s2, vec=[(b, kinds2[b]) for b in sel_v2], extra=extra2,
+                                     atl=[atl_generic(b, kinds2[b], lv2) for b in atl2])
+        comps = ["pt"]
+        if any(k == "lorentz" for _, k in vec_any):
+            comps = st.multiselect("…4-vector components", loader.COMPONENTS, default=["pt"], key="g_comp",
+                                   help="of each chosen element (units as stored, e.g. MeV)")
+        columns = generic_columns(sel_s, [(b, kinds[b]) for b in sel_v], reds, comps, extra,
+                                  [s_ for s_ in atl_specs if not s_.get("level")])
+        if match_gen:
+            columns.update({k: k for k in match_gen["keys"]})
+            cols2 = generic_columns(match_gen["scal"], match_gen["vec"], reds, comps, match_gen["extra"],
+                                    match_gen["atl"])
+            # a second-level column named like a main one (same branch in both trees) gets the level name in front
+            cols2 = {(f"{match_gen['name']}_{n}" if n in columns else n): e for n, e in cols2.items()}
+            match_req = dict(tree=match_gen["tree"], name=match_gen["name"], main=match_gen["main"],
+                             keys=match_gen["keys"], prefilter=match_gen["prefilter"],
+                             columns=sorted(cols2.items()))
 
     c1, c2 = st.columns(2)
     go_load = c1.button("Load", type="primary", use_container_width=True, disabled=not columns)
@@ -189,7 +267,8 @@ with st.sidebar.expander("Data", expanded="active" not in st.session_state):
 
 request = dict(mode=mode, path=str(path), tree=tree, columns=sorted(columns.items()), entries=int(entries),
                prefilter=prefilter or "", helpers=helpers, drop_missing=bool(P),
-               friends=pre.friend_request(P) if P else ())
+               friends=pre.friend_request(P) if P else (),
+               match=json.dumps(dict(match_req, entries=int(entries)), sort_keys=True) if match_req else "")
 if go_load:
     st.session_state["active"] = request
     st.session_state.pop("load_error", None)
@@ -209,7 +288,7 @@ try:
     with st.spinner(f"Reading {Path(active['path']).name}:{active['tree']} …"):
         df = cached_load(active["path"], active["tree"], tuple(active["columns"]), active["entries"],
                          active["prefilter"], active["helpers"], active["drop_missing"],
-                         tuple(tuple(x) for x in active.get("friends", ())))
+                         tuple(tuple(x) for x in active.get("friends", ())), active.get("match", ""))
 except Exception as e:      # noqa: BLE001
     st.error(f"Loading failed: {type(e).__name__}: {e}")
     st.stop()
@@ -222,6 +301,23 @@ labels = pre.labels(P) if P else {}
 view = View(df, derived=(P.get("derived") if P else None))
 stats_cache = st.session_state.setdefault("stats", {}).setdefault(data_key, {})
 pid = Path(presets[mode]).stem if P else "generic"
+LEVELS = df.attrs.get("levels")          # [main, second] when two trees are matched (outer join), else None
+MAIN, SECOND = LEVELS if LEVELS else (None, None)
+LEVEL_OF = df.attrs.get("level_of", {})
+LEVEL_KEYS = set(df.attrs.get("keys", [])) | ({f"in_{L}" for L in LEVELS} if LEVELS else set())
+
+
+def level_of(name):
+    """Level of a column: loaded columns from the join, new columns from the columns they use (main if mixed);
+    preset derived columns and the in_* flags count as main level."""
+    if not LEVELS:
+        return None
+    if name in LEVEL_OF:
+        return LEVEL_OF[name]
+    if name in user_defs:
+        used = {LEVEL_OF.get(x) for x in re.findall(r"[A-Za-z_]\w*", user_defs[name])} - {None}
+        return used.pop() if len(used) == 1 else MAIN
+    return MAIN
 
 
 def stats_for(name):
@@ -237,6 +333,11 @@ class _StatsProxy:
 
     def __setitem__(self, name, value):
         stats_cache[f"{name}|{_src(name)}"] = value
+
+    @staticmethod
+    def rows(name):
+        """Matched dataset: statistics of a column only over the events of its level (not the fill values)."""
+        return view[f"in_{level_of(name)}"].astype(bool) if LEVELS and name not in LEVEL_KEYS else None
 
 
 def _src(name):
@@ -361,6 +462,7 @@ for i, spec in enumerate(specs):
         view.aliases.update(r["aliases"])
         view._memo.clear()
     r["page"] = on_page
+    r["level"] = spec.get("level") or MAIN
     results.append(r)
 alias_choices = tuple((r["label"], r.get("choice")) for r in results if r["kind"] == "alias")
 
@@ -447,10 +549,13 @@ def auto_control(c, prefix, box, page):
         spec = ctl.auto_spec(view, c, SC, labels=labels.get(c), int_slider=int_as == "slider")
         if page:
             spec["place"] = "main"
+        if LEVELS and level_of(c) != MAIN:
+            spec["label"] = f"{c} · {level_of(c)}"
         # one widget key per kind: a slider cannot take over the state of a multiselect
         key = f"{prefix}{c}" + ("__range" if spec["kind"] == "range" and stats_for(c)["kind"] == "cat" else "")
         r = ctl.render(spec, view, key, SC, container=box)
         r["page"] = page
+        r["level"] = level_of(c)
         results.append(r)
     except Exception as e:      # noqa: BLE001
         box.error(f"{c}: {type(e).__name__}: {e}")
@@ -462,12 +567,12 @@ for s_ in atl_specs:          # generic mode; skipped until loaded (its columns 
     if all(c in view for c in _refs(s_)):
         try:
             r = ctl.render(at_least_spec(s_), view, f"{state_prefix}atl_{s_['label']}", SC, container=st.sidebar)
-            results.append(dict(r, page=False))
+            results.append(dict(r, page=False, level=s_.get("level") or MAIN))
         except Exception as e:      # noqa: BLE001
             st.sidebar.error(f"{s_['label']}: {type(e).__name__}: {e}")
 if not P:
     results.append(dict(ctl.render(dict(kind="expr", label="Expression cut"), view, f"{state_prefix}expr", SC,
-                                   container=st.sidebar), page=False))
+                                   container=st.sidebar), page=False, level=MAIN))
 
 # ---- page cuts on any column (main page, above the tabs)
 page_cols = page_top.multiselect("Add a page cut (slider / selector) on", all_cols, key=f"{state_prefix}page_cols",
@@ -476,16 +581,45 @@ page_cols = page_top.multiselect("Add a page cut (slider / selector) on", all_co
 for c in page_cols:
     auto_control(c, f"{state_prefix}page_", page_cell(), True)
 
-# ---- weight
-if P and P.get("weight") and P["weight"] in view:
-    w = view[P["weight"]].astype(np.float32)
-    src = view.aliases.get(P["weight"])
-    wname = P["weight"] + (f" → {src}" if isinstance(src, str) else "")
+# ---- weights (one per level)
+def weight_of(level):
+    """(float32 weights, description) of a level (None: the dataset): the preset weight column (the match spec's
+    `weight` for the second level), else a selectbox over that level's float columns."""
+    wcol = (P.get("weight") if level in (None, MAIN) else P["match"].get("weight")) if P else None
+    if wcol and wcol in view:
+        src = view.aliases.get(wcol)
+        return view[wcol].astype(np.float32), wcol + (f" → {src}" if isinstance(src, str) else "")
+    cols_ = [c for c in all_cols if view[c].dtype.kind == "f" and level_of(c) == level]
+    key = f"{state_prefix}weight" + ("" if level in (None, MAIN) else f"_{level}")
+    wsel = st.sidebar.selectbox("Weight" + (f" ({level})" if level else ""), ["(none)"] + cols_, key=key)
+    return (np.ones(len(view), np.float32) if wsel == "(none)" else view[wsel].astype(np.float32)), wsel
+
+
+sel_results = [r for r in results if not r.get("page")]
+page_results = [r for r in results if r.get("page")]
+page_idx = [i for i, r in enumerate(results) if r.get("page")]
+
+with header_box:
+    st.markdown(f"#### {mode if P else 'Generic'} · `{Path(active['path']).name}` : `{active['tree']}`"
+                + (f" ⟷ `{json.loads(active['match'])['tree']}`" if LEVELS else ""))
+if LEVELS:
+    w_lv = {L: weight_of(L) for L in LEVELS}
+    flag = {L: view[f"in_{L}"].astype(bool) for L in LEVELS}
+    match_w = st.session_state.get(f"{state_prefix}match_w", MAIN)      # widget in the Unfolding tab
+    POPS = [f"{MAIN}-selected", f"{SECOND}-selected", "matched", f"{MAIN} only (fakes)", f"{SECOND} only (misses)"]
+    with header_box:
+        pop_name = st.radio("Events", POPS, horizontal=True, key=f"{state_prefix}population",
+                            help=f"{MAIN} / {SECOND}-selected: in that tree and passing that level's cuts; matched: "
+                                 f"both; fakes: {MAIN}-selected only; misses: {SECOND}-selected only. Each control "
+                                 f"belongs to the level of its column (main level for derived columns).")
+    POP = POPS.index(pop_name)
+    wname = [w_lv[MAIN][1], w_lv[SECOND][1], w_lv[match_w][1], w_lv[MAIN][1], w_lv[SECOND][1]][POP]
+    w = np.nan_to_num([w_lv[MAIN][0], w_lv[SECOND][0], w_lv[match_w][0], w_lv[MAIN][0], w_lv[SECOND][0]][POP])
+    pop_base = [flag[MAIN], flag[SECOND], flag[MAIN] & flag[SECOND], flag[MAIN], flag[SECOND]][POP]
 else:
-    num_cols = [c for c in all_cols if view[c].dtype.kind == "f"]
-    wsel = st.sidebar.selectbox("Weight", ["(none)"] + num_cols, key=f"{state_prefix}weight")
-    w = np.ones(len(view), np.float32) if wsel == "(none)" else view[wsel].astype(np.float32)
-    wname = wsel
+    w, wname = weight_of(None)
+    POP, pop_name, pop_base = 0, "selected", None
+
 
 with st.sidebar.expander("Settings"):
     st.radio("Slider range (without preset limits)", list(ctl.RANGE_MODES), key="opt_slider_range",
@@ -494,14 +628,31 @@ with st.sidebar.expander("Settings"):
                   "so hard thresholds (e.g. pT > 20 GeV) stay reachable while far tails do not stretch the slider. "
                   "A handle at a slider end never cuts.")
 
-sel_results = [r for r in results if not r.get("page")]
-page_results = [r for r in results if r.get("page")]
-mask = ctl.combine(results)
-side_mask = ctl.combine(sel_results)
+
+def level_masks(exclude=()):
+    """{level: in that tree & its controls' cuts} (results with index in `exclude` left out)."""
+    out = {}
+    for L in LEVELS:
+        m = ctl.combine([r for i, r in enumerate(results) if r["level"] == L and i not in exclude])
+        out[L] = flag[L] if m is None else flag[L] & m
+    return out
+
+
+def pop_mask(exclude=()):
+    """Mask of the chosen population with all cuts but those of the results in `exclude` (N-1 plots, page cuts)."""
+    if not LEVELS:
+        m = ctl.combine([r for i, r in enumerate(results) if i not in exclude])
+        return np.ones(len(view), bool) if m is None else m
+    lm = level_masks(exclude)
+    a, b = lm[MAIN], lm[SECOND]
+    return [a, b, a & b, a & ~b, b & ~a][POP]
+
+
+mask = pop_mask()
+side_mask = pop_mask(exclude=page_idx)
 W = plots.weights(w)            # float64 weights and squares, once per rerun
-alias_sig = tuple((r["label"], r.get("choice")) for r in results if r["kind"] == "alias") + tuple(user_defs.items())
-if mask is None:
-    mask = np.ones(len(view), bool)
+alias_sig = (tuple((r["label"], r.get("choice")) for r in results if r["kind"] == "alias") + tuple(user_defs.items())
+             + (pop_name,))
 
 # state download (after widgets exist)
 state = {k: (list(v) if isinstance(v, tuple) else v) for k, v in st.session_state.items()
@@ -510,18 +661,28 @@ state_slot.download_button("Save state (.json)", json.dumps(state, indent=1), fi
                            mime="application/json", use_container_width=True)
 
 # ----------------------------------------------------------------- header
-n_all, n_sel = len(view), int(mask.sum())
-sw_all, sw_sel = float(W[0].sum()), float(W[0][mask].sum())
+base_all = np.ones(len(view), bool) if pop_base is None else pop_base
+n_all, n_sel = int(base_all.sum()), int(mask.sum())
+sw_all, sw_sel = float(W[0][base_all].sum()), float(W[0][mask].sum())
 page_cutting = any(r["mask"] is not None for r in page_results)
 with header_box:
-    st.markdown(f"#### {mode if P else 'Generic'} · `{Path(active['path']).name}` : `{active['tree']}`")
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Entries loaded", f"{n_all:,}")
+    where_ = ["in " + MAIN, "in " + SECOND, "in both", "in " + MAIN, "in " + SECOND][POP] if LEVELS else ""
+    m1.metric("Entries loaded" if not LEVELS else f"Entries ({where_})", f"{n_all:,}")
     m2.metric("Selected", f"{n_sel:,}", f"{n_sel / n_all:.2%}" if n_all else None, delta_color="off")
     m3.metric("Σw selected", f"{sw_sel:.5g}", f"{sw_sel / sw_all:.2%} of Σw" if sw_all else None, delta_color="off")
     m4.metric("Load", f"{t_load:.1f} s", "cached" if t_load < 2 else "event loop", delta_color="off")
+    if LEVELS:
+        lm_ = level_masks()
+        a_, b_ = lm_[MAIN], lm_[SECOND]
+        na, nb, nab = int(a_.sum()), int(b_.sum()), int((a_ & b_).sum())
+        st.caption(f"{MAIN}-selected {na:,} · {SECOND}-selected {nb:,} · matched {nab:,}"
+                   + (f" ({nab / na:.1%} of {MAIN}" if na else " (")
+                   + (f", {nab / nb:.1%} of {SECOND})" if nb else ")")
+                   + f" · fakes {na - nab:,} · misses {nb - nab:,}. Loaded: {int(flag[MAIN].sum()):,} in {MAIN}, "
+                   f"{int(flag[SECOND].sum()):,} in {SECOND}, {int((flag[MAIN] & flag[SECOND]).sum()):,} in both.")
     if page_cutting:
-        n_side = n_all if side_mask is None else int(side_mask.sum())
+        n_side = int(side_mask.sum())
         st.caption(f"Sidebar selection: {n_side:,} entries; the page cuts keep {n_sel:,} of them "
                    f"({n_sel / n_side:.2%})." if n_side else "Sidebar selection: no entries.")
     if dropped:
@@ -531,11 +692,17 @@ with header_box:
                    + ", ".join(f"`{k}`" for k in unusable), help="\n\n".join(f"{k}: {v}" for k, v in unusable.items()))
     for fname, err in df.attrs.get("friend_errors", {}).items():
         st.warning(f"Friend tree {fname!r} not joined: {err}")
-    desc = [r["desc"] for r in sel_results if r["desc"]]
-    pdesc = [r["desc"] for r in page_results if r["desc"]]
+    def _expr(rs):
+        desc = [r["desc"] for r in rs if r["desc"] and not r.get("page")]
+        pdesc = [r["desc"] for r in rs if r["desc"] and r.get("page")]
+        return (" &&\n".join(desc) or "(no cuts)") + ("\n// page cuts (not cutflow steps)\n&& " + " &&\n".join(pdesc)
+                                                     if pdesc else "")
     with st.expander("Selection as expression"):
-        st.code((" &&\n".join(desc) or "(no cuts)") + ("\n// page cuts (not cutflow steps)\n&& " + " &&\n".join(pdesc)
-                                                        if pdesc else ""), language="cpp")
+        if LEVELS:
+            st.code("\n\n".join(f"// {L} level (in_{L})\n" + _expr([r for r in results if r["level"] == L])
+                                for L in LEVELS), language="cpp")
+        else:
+            st.code(_expr(results), language="cpp")
         extra = "; new columns: " + ", ".join(f"`{n} = {e}`" for n, e in user_defs.items()) if user_defs else ""
         st.caption(f"weight: {wname}. `[…]` entries are column choices or Python-defined cuts{extra}.")
 
@@ -569,7 +736,8 @@ with st.expander(f"Variables to plot ({n_plot})", expanded=False):
     plot_cols = st.multiselect("Variables (Plots tab)", all_cols, default=default_plot_cols, key=plots_key,
                                label_visibility="collapsed")
 
-tab_names = ["Plots", "2D"] + (["Composition"] if P and P.get("compositions") else []) + ["Cutflow & yields"]
+tab_names = (["Plots", "2D"] + (["Composition"] if P and P.get("compositions") else []) + ["Cutflow & yields"]
+             + (["Unfolding"] if LEVELS else []))
 all_tabs = st.tabs(tab_names + list(custom))
 tabs = dict(zip(tab_names, all_tabs))
 
@@ -603,12 +771,11 @@ with tabs["Plots"]:
             bs = plots.binning(x, spec, s_)
             if nm1:
                 own = [i for i, r in enumerate(results) if r.get("column") == c]
-                m_plot = mask if not own else ctl.combine([r for i, r in enumerate(results) if i not in own])
-                m_plot = np.ones(len(view), bool) if m_plot is None else m_plot
+                m_plot = mask if not own else pop_mask(exclude=own)
                 tag = " (N-1)" if own else ""
             else:
                 m_plot, tag = mask, ""
-            fig = plots.hist1d(x, W, None, m_plot, bs, spec.get("title", c) + tag, xlabel=c, normalise=norm,
+            fig = plots.hist1d(x, W, pop_base, m_plot, bs, spec.get("title", c) + tag, xlabel=c, normalise=norm,
                                logy=logy, ratio=ratio, stack=stack_arg,
                                base_key=(data_key, c, wname, alias_sig))
             grid[k % ncol].plotly_chart(fig, use_container_width=True, key=f"plot_{c}")
@@ -699,13 +866,35 @@ if "Composition" in tabs:
                     st.error(f"{cs.get('title', i)}: {type(e).__name__}: {e}")
 
 with tabs["Cutflow & yields"]:
-    cf = plots.cutflow(sel_results, w, page=page_results)
     h1, h2 = st.columns([5, 1])
-    h1.markdown("**Cutflow** (controls applied cumulatively, in sidebar order)")
+    h1.markdown("**Cutflow** (controls applied cumulatively, in sidebar order"
+                + (", one per level: each starts from the events of that tree)" if LEVELS else ")"))
     cf_log = h2.toggle("Log x", key="opt_cf_log")
-    st.plotly_chart(plots.cutflow_fig(cf, logx=cf_log), use_container_width=True, key="cutflow_fig")
-    show_table(cf, {"sumw": "{:.5g}", "err": "{:.3g}", "eff_step": "{:.4f}", "eff_total": "{:.4f}"})
-    st.download_button("Cutflow CSV", cf.to_csv(index=False), file_name=f"cutflow_{pid}.csv", mime="text/csv")
+    for L in (LEVELS or [None]):
+        if L is None:
+            cf = plots.cutflow(sel_results, w, page=page_results)
+        else:
+            st.markdown(f"**{L} level** · weight: {w_lv[L][1]}")
+            cf = plots.cutflow([r for r in sel_results if r["level"] == L], np.nan_to_num(w_lv[L][0]),
+                               base_mask=flag[L], page=[r for r in page_results if r["level"] == L])
+        st.plotly_chart(plots.cutflow_fig(cf, logx=cf_log), use_container_width=True, key=f"cutflow_fig_{L}")
+        show_table(cf, {"sumw": "{:.5g}", "err": "{:.3g}", "eff_step": "{:.4f}", "eff_total": "{:.4f}"})
+        st.download_button("Cutflow CSV", cf.to_csv(index=False), file_name=f"cutflow_{pid}{'_' + L if L else ''}.csv",
+                           mime="text/csv", key=f"cutflow_csv_{L}")
+    if LEVELS:
+        lm_ = level_masks()
+        a_, b_ = lm_[MAIN], lm_[SECOND]
+        wm, ws, wx = (np.nan_to_num(w_lv[x][0]).astype(np.float64) for x in (MAIN, SECOND, match_w))
+        rows = [(f"{MAIN}-selected", a_, wm), (f"{SECOND}-selected", b_, ws), ("matched", a_ & b_, wx),
+                (f"{MAIN} only (fakes)", a_ & ~b_, wm), (f"{SECOND} only (misses)", b_ & ~a_, ws)]
+        summ = pd.DataFrame([dict(events=n_, N=int(m_.sum()), sumw=float(w_[m_].sum())) for n_, m_, w_ in rows])
+        with np.errstate(divide="ignore", invalid="ignore"):
+            summ[f"N / {MAIN}-sel."] = summ.N / summ.N[0]
+            summ[f"N / {SECOND}-sel."] = summ.N / summ.N[1]
+        st.markdown(f"**Matching** ({MAIN} ⟷ {SECOND} on {', '.join(df.attrs.get('keys', []))}; matched Σw with "
+                    f"the {match_w} weight)")
+        show_table(summ, {"N": "{:,.0f}", "sumw": "{:.5g}", f"N / {MAIN}-sel.": "{:.4f}",
+                          f"N / {SECOND}-sel.": "{:.4f}"})
     if cat_cols:
         yc = st.selectbox("Yields by", cat_cols, index=cat_cols.index("origin") if "origin" in cat_cols else 0,
                           key=f"{state_prefix}yields_by")
@@ -715,10 +904,112 @@ with tabs["Cutflow & yields"]:
         show_table(yt, {"sumw": "{:.5g}", "err": "{:.3g}", "fraction": "{:.4f}"})
         st.download_button("Yields CSV", yt.to_csv(index=False), file_name=f"yields_{yc}_{pid}.csv", mime="text/csv")
 
+
+
+def partner(c, candidates):
+    """Second-level column most likely paired with `c`: the one sharing the longest name ending (pt0 ↔ pl_pt0)."""
+    rev = c[::-1]
+    return max(candidates, key=lambda x: (len(os.path.commonprefix([x[::-1], rev])), -len(x))) if candidates else None
+
+
+def unfold_bins(txt, xr_c, xt_c, preset_bins=None):
+    """Binning shared by both levels: preset bins, typed `lo:hi:n` or edges `e0, e1, …`, else automatic (the reco
+    column's classes / 10 bins over its slider range)."""
+    txt = (txt or "").strip()
+    if txt:
+        if ":" in txt:
+            lo_, hi_, n_ = (float(v) for v in txt.split(":"))
+            return ("num", np.linspace(lo_, hi_, int(n_) + 1))
+        e_ = sorted(float(v) for v in re.split(r"[,\s]+", txt) if v)
+        if len(e_) < 2:
+            raise ValueError("give at least two bin edges, or lo:hi:n")
+        return ("num", np.asarray(e_))
+    if preset_bins is not None:
+        return plots.binning(view[xr_c], {"bins": preset_bins}, stats_for(xr_c))
+    sr, st_ = stats_for(xr_c), stats_for(xt_c)
+    if sr["kind"] == "cat" or xr_c in labels:
+        vals = sorted(set(sr.get("values") or []) | set(st_.get("values") or []) | set(labels.get(xr_c) or []))
+        return ("cat", vals, [plots.fmt_label(v, labels.get(xr_c)) for v in vals])
+    lo_, hi_ = ctl.slider_limits(sr)
+    return ("num", np.linspace(lo_, hi_ if hi_ > lo_ else lo_ + 1, 11))
+
+
+class NoPair(Exception):
+    """No variable pair chosen in the Unfolding tab (nothing to show)."""
+
+
+if "Unfolding" in tabs:
+    with tabs["Unfolding"]:
+        ucols = {L: [c for c in all_cols if level_of(c) == L and c not in df.attrs.get("keys", [])
+                     and not c.startswith("in_")] for L in LEVELS}
+        pairs = {(u.get("title") or f"{u[MAIN]} ⟷ {u[SECOND]}"): u for u in ((P.get("unfold") or []) if P else [])
+                 if u[MAIN] in all_cols and u[SECOND] in all_cols}
+        u1, u2, u3 = st.columns(3)
+        pick = u1.selectbox("Variable", list(pairs) + ["any pair"], key=f"{state_prefix}unf_pair")
+        xr_c = xt_c = pbins = None
+        if pick == "any pair" and (not ucols[MAIN] or not ucols[SECOND]):
+            st.info(f"Load at least one column on each level ({MAIN}, {SECOND}).")
+        elif pick == "any pair":
+            xr_c = u2.selectbox(f"{MAIN} variable", ucols[MAIN], key=f"{state_prefix}unf_x_{MAIN}")
+            guess = partner(xr_c, ucols[SECOND])
+            xt_c = u3.selectbox(f"{SECOND} variable", ucols[SECOND], index=ucols[SECOND].index(guess),
+                                key=f"{state_prefix}unf_x_{SECOND}_{xr_c}")
+            pbins = None
+        else:
+            xr_c, xt_c, pbins = pairs[pick][MAIN], pairs[pick][SECOND], pairs[pick].get("bins")
+            u2.markdown(f"{MAIN}: `{xr_c}`  \n{SECOND}: `{xt_c}`")
+        b1, b2, b3, b4 = st.columns([2, 2, 2, 2])
+        bins_txt = b1.text_input("Bins", key=f"{state_prefix}unf_bins",
+                                 placeholder="auto · 0, 25, 50, 100 · 0:200:20",
+                                 help="empty: automatic (or the preset's); edges separated by commas; lo:hi:n for n "
+                                      "equal bins. Same binning on both levels.")
+        unorm = {"% of truth row": "row", "Σw": "none", "% of reco column": "column", "% of total": "total"}
+        un = b2.selectbox("Migration matrix", list(unorm), key=f"{state_prefix}unf_norm",
+                          help=f"rows: {SECOND} bins (y), columns: {MAIN} bins (x); matched events only")
+        utext = {"value": "value", "entries (N)": "entries", "none": None}
+        ut = b3.selectbox("Numbers in bins", list(utext), key=f"{state_prefix}unf_text")
+        b4.radio("Matched events weighted with", LEVELS, horizontal=True, key=f"{state_prefix}match_w",
+                 help="weight that fills the migration matrix (and the 'matched' events); acceptance and efficiency "
+                      "come from the same matrix")
+        uover = st.toggle("Values outside the binning in the edge bins", key=f"{state_prefix}unf_over",
+                          help="off: entries outside the bins are left out (they migrate out of the range)")
+        try:
+            if xr_c is None:
+                raise NoPair
+            bspec = unfold_bins(bins_txt, xr_c, xt_c, pbins)
+            lm_ = level_masks()
+            sel_r, sel_t = lm_[MAIN], lm_[SECOND]
+            wr, wt, wx = (np.nan_to_num(w_lv[x][0]) for x in (MAIN, SECOND, match_w))
+            M, C, utab = plots.unfolding(view[xr_c], view[xt_c], wx, wr, wt, sel_r, sel_t, bspec, overflow=uover)
+            g1, g2 = st.columns(2)
+            g1.plotly_chart(plots.hist2d(view[xr_c], view[xt_c], wx, sel_r & sel_t, bspec, bspec,
+                                         f"{xr_c} ({MAIN})", f"{xt_c} ({SECOND})", norm=unorm[un],
+                                         text=utext[ut], overflow=uover), use_container_width=True, key="unf_mig")
+            g2.plotly_chart(plots.unfolding_fig(utab, f"{xr_c} ⟷ {xt_c}"), use_container_width=True, key="unf_fig")
+            show_table(utab, {c: "{:.4f}" for c in ("acceptance", "efficiency", "purity", "stability")}
+                       | {c: "{:.5g}" for c in ("sumw_reco", "sumw_truth", "matched_reco", "matched_truth")}
+                       | {c: "{:,.0f}" for c in ("N_reco", "N_truth", "N_matched_reco", "N_matched_truth")})
+            d1, d2 = st.columns(2)
+            d1.download_button("Table CSV", utab.to_csv(index=False), file_name=f"unfolding_{xr_c}.csv",
+                               mime="text/csv", key="unf_csv")
+            labs = utab["bin"].tolist()
+            d2.download_button("Migration matrix CSV (rows: truth bins)",
+                               pd.DataFrame(M, index=labs, columns=labs).to_csv(), file_name=f"migration_{xr_c}.csv",
+                               mime="text/csv", key="unf_mig_csv")
+            st.caption(f"Columns *_reco / *_truth: per {MAIN} / {SECOND} bin. acceptance = matched / {MAIN}-selected "
+                       f"(per {MAIN} bin), efficiency = matched / {SECOND}-selected (per {SECOND} bin), purity / "
+                       f"stability = diagonal / column / row sum. Weights: {MAIN} {w_lv[MAIN][1]}, {SECOND} "
+                       f"{w_lv[SECOND][1]}, matched {w_lv[match_w][1]}.")
+        except NoPair:
+            pass
+        except Exception as e:      # noqa: BLE001
+            st.error(f"{type(e).__name__}: {e}")
+
 for tab, (title, fn) in zip(all_tabs[len(tab_names):], custom.items()):
     with tab:
         try:
-            items = fn(dict(view=view, mask=mask, weight=w, results=results, labels=labels))
+            items = fn(dict(view=view, mask=mask, weight=w, results=results, labels=labels, levels=LEVELS,
+                            level_masks=level_masks() if LEVELS else None, population=pop_name))
         except Exception as e:      # noqa: BLE001
             st.error(f"{type(e).__name__}: {e}")
             continue

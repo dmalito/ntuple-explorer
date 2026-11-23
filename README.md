@@ -64,7 +64,8 @@ RDataFrame expression would otherwise abort the whole Python process.
 | Plots | 1D histograms of the columns picked in *Variables to plot* (a collapsible box above the tabs): all loaded entries (grey line) vs selected (filled), optional ratio panel (fraction kept per bin), normalisation, log y, stacking by a category. In N-1 mode (default) each plot ignores the cuts on its own variable |
 | 2D | weighted 2D histogram of any two columns: Σw or normalised to the total, per row or per column (e.g. migration-style matrices); optional numbers in each bin (the shown value or the unweighted entries) |
 | Composition | one category stacked inside the classes of another (e.g. truth origin × reconstruction status): bars at 100 % per row, % of the total or Σw; optional panels split by a third category; extra `where` cut; table + CSV. Shown only when the preset defines `compositions` |
-| Cutflow & yields | the controls applied cumulatively in sidebar order: bar chart and table (N, Σw, efficiencies) and yields per class of a category; CSV |
+| Cutflow & yields | the controls applied cumulatively in sidebar order: bar chart and table (N, Σw, efficiencies) and yields per class of a category; CSV. With two matched trees: one cutflow per level and a matching summary |
+| Unfolding | only with two matched trees (see *Matching two trees*): migration matrix, acceptance, efficiency, purity and stability of one variable; tables and CSV |
 | custom | any tabs a preset defines |
 
 The sidebar also has **Save / load selection** (all control values as JSON, page cuts and new columns included) and
@@ -99,6 +100,39 @@ so `a > 0 | b > 0` is an OR of two conditions), `a if cond else b`, and the func
 `where(cond, a, b)`, `count(cond, ...)` (how many are true), `isin(x, v1, v2, ...)`, `abs`, `sqrt`, `exp`, `log`,
 `log10`, `sin`, `cos`, `tan`, `arctan2`, `hypot`, `floor`, `ceil`. Plain expressions run through numexpr, the
 others through numpy.
+
+## Matching two trees (reco ↔ truth, unfolding)
+
+Two trees of the same file can be matched event by event, on keys such as `runNumber` and `eventNumber`: generic mode
+has *Match events with a second tree* in the data section (second tree, keys, level names, its branches), presets
+have `match` (below). Both trees are read and *outer-joined*: one row per event found in either tree, with the flags
+`in_<level>` (e.g. `in_reco`, `in_truth`). A level's columns are NaN (floats) or −1 (integers) for events missing from
+it; slider ranges and categories come from that level's events only.
+
+Each level has its own weight and its own cuts: every control belongs to the level of its column (presets:
+`level="truth"`; derived columns and the `in_*` flags count as the main level). A switch above the tabs picks the
+events every plot and table shows:
+
+| events | definition |
+| --- | --- |
+| *reco*-selected | in the reco tree and passing the reco cuts |
+| *truth*-selected | in the truth tree and passing the truth cuts |
+| matched | both |
+| fakes | reco-selected, not truth-selected |
+| misses | truth-selected, not reco-selected |
+
+The Cutflow tab gets one cutflow per level and a matching summary (N, Σw, fractions). The **Unfolding** tab takes a
+reco variable and its truth partner (guessed from the name, or a preset `unfold` pair) with one binning for both
+(automatic, edges `0, 25, 50, 100` or `lo:hi:n`) and shows, with M[i, j] the matched Σw in truth bin i and reco bin j:
+
+- the migration matrix (truth bins as rows; normalised per truth row, per reco column, to the total, or Σw);
+- acceptance per reco bin = Σ_i M[i, j] / Σw(reco-selected in bin j);
+- efficiency per truth bin = Σ_j M[i, j] / Σw(truth-selected in bin i);
+- purity = M[j, j] / Σ_i M[i, j], stability = M[i, i] / Σ_j M[i, j].
+
+The matrix is filled with the reco or the truth weight (a choice in the tab, also used for the *matched* events);
+acceptance and efficiency come from the same matrix. Values outside the binning are left out (migrations out of the
+range) unless *Values outside the binning in the edge bins* is on.
 
 ## Generic mode
 
@@ -183,6 +217,8 @@ PRESET = dict(
 | `labels` | `{column: {value: label}}` (or a list) for axes and selectors |
 | `derived` | `{name: f(view) -> array}`: numpy columns computed after loading |
 | `weight` | column name of the event weight |
+| `match` | `dict(tree, name="truth", main="reco", keys=["runNumber", "eventNumber"], columns, categories, prefilter, weight, fill=-1)`: a second level matched event by event (see *Matching two trees*); `columns` names must differ from the main ones, `weight` is a column of this level |
+| `unfold` | `[dict(<main level>=column, <second level>=column, bins=(lo, hi, n) or edges, title)]`, e.g. `dict(reco="lep_pt", truth="pl_lep_pt", bins=[25, 50, 100, 200])`: variable pairs offered in the Unfolding tab |
 | `friends` | `{name: dict(tree, columns, categories, keys=["runNumber", "eventNumber"], prefilter, found, fill)}`: columns of another tree of the same file, joined to each entry on the event keys (e.g. truth-level info for reco events). `found` names an int8 column, 1 if the event is in that tree after its prefilter; missing entries get `fill` (default −1, NaN for floats) |
 | `controls` | list of control specs (below), rendered in order; later controls see the column choices made by earlier ones |
 | `plots` | `[dict(column, title, bins=(lo, hi, n) or edges, nbins)]` shown by default |
@@ -204,7 +240,8 @@ Control specs (`kind`):
 | `expr` | `default` | free cut expression |
 | `at_least` | `vector` (4-vector branch) + `of="pt"` (or eta, phi, E, m), or `values` (any vector expression, e.g. `jet_pt / 1000.`); `where` (object requirement, e.g. `abs(jet_eta) < 2.5` or `abs(nx_etas(jet_p4)) < 2.5`), `max_n=4`, `default=(N, X)`, `what` | *at least N objects with value ≥ X*: N (any, 1 … max_n) and a threshold slider; at the slider's lower end only the count is required. Works because "at least N above X" = "the N-th largest above X": the loader stores the 1st … max_n-th largest value per entry (sorted in C++); `where` is fixed at load time |
 
-Common optional fields: `label`, `help`, `dropdown=True` (selectbox instead of radio), `place="main"` (a page cut
+Common optional fields: `label`, `help`, `dropdown=True` (selectbox instead of radio), `level` (with `match`: the
+level the cut belongs to, default the main one), `place="main"` (a page cut
 above the tabs instead of a sidebar cut; see *Selections*).
 Expressions in controls are strings over view columns (syntax in *Selections*), or `f(view) -> bool array`.
 

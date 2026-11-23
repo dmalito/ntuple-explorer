@@ -22,7 +22,7 @@ def preset_dirs():
 
 KEYS = {"name", "description", "files", "tree", "helpers", "prefilter", "columns", "categories", "labels", "derived",
         "weight", "controls", "plots", "stack_options", "custom", "postprocess", "plots_2d", "friends", "compositions",
-        "colors"}
+        "colors", "match", "unfold"}
 NORMS = {"row", "total", "yields"}
 PLACES = {"sidebar", "main"}       # sidebar: selection + cutflow steps; main: page cuts above the tabs
 KINDS = {"alias", "select", "multiselect", "checkboxes", "range", "toggle", "expr", "at_least"}
@@ -64,7 +64,22 @@ def validate(p, where="preset"):
     for k in ("name", "tree", "columns"):
         if k not in p:
             raise KeyError(f"{where}: missing {k!r}")
+    lv = levels(p) or [None]
+    m = p.get("match")
+    if m is not None:
+        if "tree" not in m or "columns" not in m:
+            raise KeyError(f"{where}: match needs 'tree' and 'columns'")
+        if lv[0] == lv[1] or not all(str(x).isidentifier() for x in lv):
+            raise ValueError(f"{where}: match level names {lv} must be two different identifiers")
+        clash = set(friend_columns(m)) & set(loader_columns(p))
+        if clash:
+            raise KeyError(f"{where}: match columns {sorted(clash)} clash with main columns")
+    for i, u in enumerate(p.get("unfold") or []):
+        if not m or not all(u.get(x) for x in lv):
+            raise KeyError(f"{where}: unfold {i} needs a match and the columns {lv} (one per level)")
     for i, c in enumerate(p.get("controls", [])):
+        if c.get("level") is not None and c["level"] not in lv:
+            raise ValueError(f"{where}: control {i} level {c['level']!r}, expected one of {lv}")
         if c.get("kind") not in KINDS:
             raise ValueError(f"{where}: control {i} has kind {c.get('kind')!r}, expected one of {sorted(KINDS)}")
         if c["kind"] in ("multiselect", "range") and "column" not in c:
@@ -116,10 +131,31 @@ def loader_columns(p):
     for name, classes in p.get("categories", {}).items():
         cols[name] = category_expr(classes)
         cols[f"__overlap_{name}"] = overlap_expr(classes)
+    lv = levels(p)
     for c in p.get("controls", []):
-        if c.get("kind") == "at_least":
+        if c.get("kind") == "at_least" and (not lv or c.get("level", lv[0]) == lv[0]):
             cols.update(loader.nth_columns(c))
+    if lv:
+        cols.update({k: k for k in p["match"].get("keys", ["runNumber", "eventNumber"])})
     return cols
+
+
+def levels(p):
+    """[main level, second level] names of a preset with `match`, else None."""
+    m = p.get("match")
+    return [m.get("main", "reco"), m.get("name", "truth")] if m else None
+
+
+def match_request(p):
+    """Load request (dict) of the second level: its columns (+ categories, + at_least columns of its controls)."""
+    m = p["match"]
+    name = levels(p)[1]
+    cols = friend_columns(m)
+    for c in p.get("controls", []):
+        if c.get("kind") == "at_least" and c.get("level") == name:
+            cols.update(loader.nth_columns(c))
+    return dict(tree=m["tree"], name=name, main=levels(p)[0], keys=list(m.get("keys", ["runNumber", "eventNumber"])),
+                prefilter=m.get("prefilter"), fill=m.get("fill", -1), columns=sorted(cols.items()))
 
 
 def friend_columns(f):
