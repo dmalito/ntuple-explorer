@@ -340,7 +340,8 @@ def composition(rows, row_names, segs, seg_names, w, mask, norm="row", horizonta
                        legendgroup=lab, showlegend=(p == 0), text=txt, textposition="inside",
                        insidetextanchor="middle", textfont=dict(color=_ink(col), size=11), customdata=cd,
                        hovertemplate=("%{" + ("y" if horizontal else "x") + "}<br><b>%{customdata[0]}</b>: "
-                                      + ("%{" + ("x" if horizontal else "y") + ":.3g}" + unit + " · " if norm != "row" else "")
+                                      + ("%{" + ("x" if horizontal else "y") + ":.3g}" + unit + " · "
+                                         if norm != "row" else "")
                                       + "%{customdata[1]:.2f}% of the row<br>Σw %{customdata[2]:.4g} · "
                                       "N %{customdata[3]:,.0f}<extra></extra>"))
             if horizontal:
@@ -479,7 +480,8 @@ def cutflow_fig(cf, logx=False):
     pct = [f"{100 * e:.3g}%" for e in cf["eff_total"]]
     fig = go.Figure(go.Bar(
         x=cf["sumw"], y=steps, orientation="h", error_x=dict(type="data", array=cf["err"], thickness=1, width=0),
-        marker_color=[REFERENCE if i == 0 else SERIES[1] if s == PAGE_STEP else SELECTED for i, s in enumerate(cf["step"])],
+        marker_color=[REFERENCE if i == 0 else SERIES[1] if s == PAGE_STEP else SELECTED
+                      for i, s in enumerate(cf["step"])],
         text=pct, textposition="outside",
         customdata=np.c_[cf["N"], cf["eff_step"], cf["eff_total"], cf["cut"]],
         hovertemplate=("<b>%{y}</b><br>%{customdata[3]}<br>Σw %{x:.5g} · N %{customdata[0]:,.0f}<br>"
@@ -499,5 +501,6 @@ def yields_by(codes, names, w, mask):
     for c, n in names.items():
         m = codes == c if mask is None else (mask & (codes == c))
         sw, sw2 = _sum(w, m)
-        rows.append(dict(category=str(n), N=int(m.sum()), sumw=sw, err=np.sqrt(sw2), fraction=sw / tot if tot else np.nan))
+        rows.append(dict(category=str(n), N=int(m.sum()), sumw=sw, err=np.sqrt(sw2),
+                         fraction=sw / tot if tot else np.nan))
     return pd.DataFrame(rows)

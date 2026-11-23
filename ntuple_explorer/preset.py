@@ -8,6 +8,8 @@ import os
 import sys
 from pathlib import Path
 
+import loader
+
 
 def preset_dirs():
     """Folders searched for presets, in order: NTUPLE_EXPLORER_PRESETS (os.pathsep-separated), presets/ at the
@@ -23,7 +25,7 @@ KEYS = {"name", "description", "files", "tree", "helpers", "prefilter", "columns
         "colors"}
 NORMS = {"row", "total", "yields"}
 PLACES = {"sidebar", "main"}       # sidebar: selection + cutflow steps; main: page cuts above the tabs
-KINDS = {"alias", "select", "multiselect", "checkboxes", "range", "toggle", "expr"}
+KINDS = {"alias", "select", "multiselect", "checkboxes", "range", "toggle", "expr", "at_least"}
 
 
 def discover():
@@ -69,6 +71,10 @@ def validate(p, where="preset"):
             raise KeyError(f"{where}: control {i} ({c['kind']}) needs 'column'")
         if c["kind"] in ("alias", "select", "checkboxes") and not c.get("options"):
             raise KeyError(f"{where}: control {i} ({c['kind']}) needs 'options'")
+        if c["kind"] == "at_least" and not (c.get("vector") or c.get("values")):
+            raise KeyError(f"{where}: control {i} (at_least) needs 'vector' (4-vector branch) or 'values' (expression)")
+        if c["kind"] == "at_least" and str(c.get("of", "pt")).lower() not in {x.lower() for x in loader.COMPONENTS}:
+            raise ValueError(f"{where}: control {i} of={c.get('of')!r}, expected one of {loader.COMPONENTS}")
         if c.get("place", "sidebar") not in PLACES:
             raise ValueError(f"{where}: control {i} place {c.get('place')!r}, expected one of {sorted(PLACES)}")
     for name in p.get("categories", {}):
@@ -104,11 +110,15 @@ def overlap_expr(classes):
 
 
 def loader_columns(p):
-    """All ROOT expressions to load: preset columns + one int column per category (+ an overlap counter)."""
+    """All ROOT expressions to load: preset columns + one int column per category (+ an overlap counter) + the k-th
+    largest values behind at_least controls."""
     cols = dict(p["columns"])
     for name, classes in p.get("categories", {}).items():
         cols[name] = category_expr(classes)
         cols[f"__overlap_{name}"] = overlap_expr(classes)
+    for c in p.get("controls", []):
+        if c.get("kind") == "at_least":
+            cols.update(loader.nth_columns(c))
     return cols
 
 

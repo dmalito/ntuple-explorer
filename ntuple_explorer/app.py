@@ -112,6 +112,7 @@ if mode != GENERIC:
     if P.get("description"):
         st.sidebar.caption(P["description"])
 
+atl_specs = []          # generic mode: "at least N above X" cuts on vector branches (presets: at_least controls)
 with st.sidebar.expander("Data", expanded="active" not in st.session_state):
     files = dict(P["files"]) if P and P.get("files") else {f: f for f in root_files()}
     files = {k: v for k, v in files.items() if loader.resolve(v).exists()} or files
@@ -152,6 +153,14 @@ with st.sidebar.expander("Data", expanded="active" not in st.session_state):
         if any(kinds[b] == "lorentz" for b in sel_v):
             comps = st.multiselect("…4-vector components", loader.COMPONENTS, default=["pt"], key="g_comp",
                                    help="of each chosen element (units as stored, e.g. MeV)")
+        atl_opts = [b for b in vec if kinds[b] in ("number", "lorentz")]
+        atl = st.multiselect("'At least N above X' cuts on", atl_opts, key="g_atl",
+                             format_func=lambda b: b + vtag[kinds[b]],
+                             help=f"loads the 1st … {loader.NTH_MAX}th largest value per entry (pt for 4-vectors); "
+                                  "the "
+                                  "cut then picks N and the threshold X interactively")
+        atl_specs = [dict(kind="at_least", label=b, **({"vector": b} if kinds[b] == "lorentz" else {"values": b}))
+                     for b in atl]
         other = info.loc[~info.is_vector & ~num, "branch"].tolist()
         if other:
             st.caption("Not listed (single objects): " + ", ".join(f"`{b}`" for b in other)
@@ -162,6 +171,8 @@ with st.sidebar.expander("Data", expanded="active" not in st.session_state):
         columns = {b: b for b in sel_s}
         for b in sel_v:
             columns.update(loader.vector_columns(b, kinds[b], reds, comps))
+        for s_ in atl_specs:
+            columns.update(loader.nth_columns(s_))
         for line in extra.splitlines():
             if "=" in line and line.split("=", 1)[0].strip().isidentifier():
                 n, e = line.split("=", 1)
@@ -285,6 +296,11 @@ def page_cell():
     return _page_cells.pop(0)
 
 
+# app settings: read before the controls are drawn, widgets at the bottom of the sidebar
+RANGE_LABELS = {"snapped": "0.1–99.9 % quantiles, snapped to min / max when close",
+                "quantiles": "0.1–99.9 % quantiles", "full": "full range (min – max)"}
+ctl.RANGE_MODE = st.session_state.get("opt_slider_range", "snapped")
+
 st.sidebar.markdown("### Selection")
 results = []
 user_defs = {}          # new columns typed in the app: name -> expression
@@ -307,9 +323,19 @@ def _alias_ok(spec):
 
 def _refs(spec):
     """Columns a control needs (to skip controls on columns dropped for this file)."""
+    if spec["kind"] == "at_least":
+        return list(loader.nth_columns(spec))
     if spec.get("column"):
         return [spec["column"]]
     return []
+
+
+def at_least_spec(spec):
+    """An at_least spec ready for ctl.render: the names of its k-th largest columns, and what the threshold is on."""
+    vals = str(spec.get("values", ""))
+    what = spec.get("what") or (spec.get("of", "pt") if spec.get("vector")
+                                else vals if vals.isidentifier() else "value")
+    return dict(spec, columns=list(loader.nth_columns(spec)), what=what)
 
 
 specs = list(P.get("controls", [])) if P else []
@@ -322,6 +348,8 @@ for i, spec in enumerate(specs):
         continue
     if spec["kind"] in ("multiselect", "range") and spec.get("labels") is None and spec["column"] in labels:
         spec = dict(spec, labels=labels[spec["column"]])
+    if spec["kind"] == "at_least":
+        spec = at_least_spec(spec)
     on_page = spec.get("place") == "main"
     box = page_cell() if on_page else st.sidebar
     try:
@@ -395,7 +423,8 @@ with st.sidebar.expander("New columns", expanded=bool(st.session_state.get(defs_
                         key=f"{state_prefix}comb_cols")
     k1, k2 = st.columns(2)
     cop = k1.selectbox("as", list(COMBINE), key=f"{state_prefix}comb_op",
-                       help="OR / AND / count: of `column ≠ 0`; max: a slider on it at ≥ x is an OR of `column ≥ x`")
+                       help="OR / AND / count: of `column ≠ 0`; "
+                            "max: a slider on it at ≥ x is an OR of `column ≥ x`")
     cname = k2.text_input("name", key=f"{state_prefix}comb_name", placeholder="automatic")
     st.button("Add column", on_click=_add_combined, args=(tuple(cc), cop, cname), disabled=not cc,
               use_container_width=True)
@@ -429,6 +458,13 @@ def auto_control(c, prefix, box, page):
 
 for c in extra_cols:
     auto_control(c, f"{state_prefix}auto_", st.sidebar, False)
+for s_ in atl_specs:          # generic mode; skipped until loaded (its columns appear after Load)
+    if all(c in view for c in _refs(s_)):
+        try:
+            r = ctl.render(at_least_spec(s_), view, f"{state_prefix}atl_{s_['label']}", SC, container=st.sidebar)
+            results.append(dict(r, page=False))
+        except Exception as e:      # noqa: BLE001
+            st.sidebar.error(f"{s_['label']}: {type(e).__name__}: {e}")
 if not P:
     results.append(dict(ctl.render(dict(kind="expr", label="Expression cut"), view, f"{state_prefix}expr", SC,
                                    container=st.sidebar), page=False))
@@ -443,12 +479,20 @@ for c in page_cols:
 # ---- weight
 if P and P.get("weight") and P["weight"] in view:
     w = view[P["weight"]].astype(np.float32)
-    wname = P["weight"] + (f" → {view.aliases[P['weight']]}" if isinstance(view.aliases.get(P["weight"]), str) else "")
+    src = view.aliases.get(P["weight"])
+    wname = P["weight"] + (f" → {src}" if isinstance(src, str) else "")
 else:
     num_cols = [c for c in all_cols if view[c].dtype.kind == "f"]
     wsel = st.sidebar.selectbox("Weight", ["(none)"] + num_cols, key=f"{state_prefix}weight")
     w = np.ones(len(view), np.float32) if wsel == "(none)" else view[wsel].astype(np.float32)
     wname = wsel
+
+with st.sidebar.expander("Settings"):
+    st.radio("Slider range (without preset limits)", list(ctl.RANGE_MODES), key="opt_slider_range",
+             format_func=RANGE_LABELS.get,
+             help=f"snapped: an end moves to the true min / max when that is within {ctl.SNAP:.0%} of the range, "
+                  "so hard thresholds (e.g. pT > 20 GeV) stay reachable while far tails do not stretch the slider. "
+                  "A handle at a slider end never cuts.")
 
 sel_results = [r for r in results if not r.get("page")]
 page_results = [r for r in results if r.get("page")]
@@ -515,7 +559,8 @@ def names_for(c):
 
 # ---- variables to plot: a collapsible box above the tabs
 plot_specs = [s for s in (P.get("plots", []) if P else []) if s["column"] in all_cols]
-default_plot_cols = [s["column"] for s in plot_specs] or [c for c in all_cols if c not in ("runNumber", "eventNumber")][:6]
+default_plot_cols = ([s["column"] for s in plot_specs]
+                     or [c for c in all_cols if c not in ("runNumber", "eventNumber")][:6])
 plots_key = f"{state_prefix}plots"
 if plots_key in st.session_state:       # drop columns that no longer exist (e.g. a removed new column)
     st.session_state[plots_key] = [c for c in st.session_state[plots_key] if c in all_cols]
@@ -621,8 +666,10 @@ if "Composition" in tabs:
                 return opts.index(v) if v in opts else fallback
 
             b1, b2, b3, b4, b5 = st.columns([2, 2, 2, 2, 1])
-            rows_c = b1.selectbox("Rows (bars)", cat_cols, index=_ix(cat_cols, d0.get("rows")), key=f"{state_prefix}comp_rows")
-            seg_c = b2.selectbox("Segments (stacked)", cat_cols, index=_ix(cat_cols, d0.get("segments"), min(1, len(cat_cols) - 1)),
+            rows_c = b1.selectbox("Rows (bars)", cat_cols, index=_ix(cat_cols, d0.get("rows")),
+                                  key=f"{state_prefix}comp_rows")
+            seg_c = b2.selectbox("Segments (stacked)", cat_cols,
+                                 index=_ix(cat_cols, d0.get("segments"), min(1, len(cat_cols) - 1)),
                                  key=f"{state_prefix}comp_seg")
             nlab = b3.radio("Normalise", list(norms), horizontal=True, key=f"{state_prefix}comp_norm",
                             index=_ix(list(norms.values()), d0.get("norm", "row")))
@@ -631,7 +678,8 @@ if "Composition" in tabs:
                                  help="one panel for all entries plus one per class (small multiples)")
             horiz = b5.toggle("Horizontal", value=d0.get("horizontal", True), key=f"{state_prefix}comp_h")
             c1, c2 = st.columns([4, 1])
-            where = c1.text_input("Only entries with (expression, on top of the sidebar selection)", key=f"{state_prefix}comp_where",
+            where = c1.text_input("Only entries with (expression, on top of the sidebar selection)",
+                                  key=f"{state_prefix}comp_where",
                                   placeholder="e.g. match_status == 0")
             use_sel = c2.toggle("Sidebar selection", value=True, key=f"{state_prefix}comp_sel")
             try:

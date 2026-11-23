@@ -38,6 +38,30 @@ template <typename V> double nx_min_pt(const V& v) {
   double m = -999.; for (auto& x : v) if (m == -999. || x.Pt() < m) m = x.Pt(); return m; }
 """
 
+# per-object values as RVecD (4-vector components) and the k-th largest value of a collection (NaN if it has fewer
+# than k + 1 elements): the columns behind "at least N objects with value >= X" (nth_columns)
+NTH_HELPERS = """
+#include <algorithm>
+#include <functional>
+#include <limits>
+#include <vector>
+template <typename V> ROOT::RVecD nx_pts(const V& v) {
+  ROOT::RVecD o(v.size()); for (std::size_t i = 0; i < v.size(); ++i) o[i] = v[i].Pt(); return o; }
+template <typename V> ROOT::RVecD nx_etas(const V& v) {
+  ROOT::RVecD o(v.size()); for (std::size_t i = 0; i < v.size(); ++i) o[i] = v[i].Eta(); return o; }
+template <typename V> ROOT::RVecD nx_phis(const V& v) {
+  ROOT::RVecD o(v.size()); for (std::size_t i = 0; i < v.size(); ++i) o[i] = v[i].Phi(); return o; }
+template <typename V> ROOT::RVecD nx_es(const V& v) {
+  ROOT::RVecD o(v.size()); for (std::size_t i = 0; i < v.size(); ++i) o[i] = v[i].E(); return o; }
+template <typename V> ROOT::RVecD nx_ms(const V& v) {
+  ROOT::RVecD o(v.size()); for (std::size_t i = 0; i < v.size(); ++i) o[i] = v[i].M(); return o; }
+template <typename V> double nx_kth(const V& v, std::size_t k) {
+  if (k >= v.size()) return std::numeric_limits<double>::quiet_NaN();
+  std::vector<double> x(v.begin(), v.end());
+  std::nth_element(x.begin(), x.begin() + k, x.end(), std::greater<double>());
+  return x[k]; }
+"""
+
 _declared = set()
 _CHAR_TYPES = {"Char_t", "UChar_t", "char", "unsigned char", "signed char", "int8_t", "uint8_t"}
 _ROOT = None
@@ -196,6 +220,7 @@ def load(path, tree, columns, entries=None, prefilter=None, helpers=DEFAULT_HELP
     ROOT = _root()
     declare(DEFAULT_HELPERS)
     declare(VECTOR_HELPERS)
+    declare(NTH_HELPERS)
     declare(helpers)
     if entries:
         ROOT.DisableImplicitMT()          # Range() is single-threaded only
@@ -361,3 +386,23 @@ def vector_columns(branch, element, reducers, components=("pt",)):
         elif element == "lorentz" and r in ("sum", "max", "min"):
             out[f"{branch}__{r}pt"] = f"nx_{r}_pt({branch})"
     return out
+
+
+# ----------------------------------------------------------------- "at least N objects with value >= X"
+NTH_MAX = 4         # default largest N
+
+
+def nth_values(spec):
+    """ROOT expression of the per-object values of an at_least spec: `values` (any RVec expression, e.g. a number
+    vector branch, `jet_pt / 1000.`) or component `of` (pt, eta, phi, E, m; default pt) of the 4-vector branch
+    `vector`; `where` (an RVec condition, e.g. `abs(nx_etas(jet_p4)) < 2.5`) keeps only some objects."""
+    v = spec.get("values") or f"nx_{spec.get('of', 'pt').lower()}s({spec['vector']})"
+    return f"({v})[{spec['where']}]" if spec.get("where") else v
+
+
+def nth_columns(spec):
+    """{column name: ROOT expression}: the k-th largest per-object value, k = 0 .. max_n - 1 (NaN if fewer objects).
+    Names start with __ (hidden from column lists) and depend only on the values / where expressions."""
+    v = nth_values(spec)
+    tag = re.sub(r"\W+", "_", v).strip("_")[:40] + "_" + hashlib.sha1(v.encode()).hexdigest()[:6]
+    return {f"__nth_{tag}_{k}": f"nx_kth({v}, {k})" for k in range(int(spec.get("max_n", NTH_MAX)))}

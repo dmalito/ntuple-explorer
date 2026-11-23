@@ -24,7 +24,7 @@ built and how to work on it.
 | `app.py` | the Streamlit page: sidebar (data source, controls, *New columns*, save/load state), header metrics, *Page cuts* box (controls with `place="main"` + page cuts on any column; results tagged `page=True`: in every mask, but only one final cutflow row), tabs (Plots, 2D, Composition only if the preset has `compositions`, Cutflow & yields, preset custom tabs). `cached_load` (st.cache_resource) = main tree + joined friend trees |
 | `loader.py` | ROOT side: `load()` (Define + one `AsNumpy`, down-cast, npz cache), `branch_info()` / `trees()` via uproot (metadata only), `check_exprs()` / `split_missing()`, `join_friend()` + `match_index()` (join another tree on event keys), generic-mode `REDUCERS` + `vector_columns()` (per element kind: number / 4-vector / object, from `element_kind()`), default helper `nx_at(v, i)` and `VECTOR_HELPERS` (`nx_pt` … `nx_max_pt`) |
 | `view.py` | `View`: name → array through aliases (set by alias controls), derived callables (preset, and the app's *New columns*), loaded columns; memoised per rerun, cycle detection; `eval()` = pandas.eval + numexpr, falling back to `np_eval()` (whitelisted AST on numpy: `FUNCS` helpers, `&& \|\| !`, `a if c else b`) |
-| `controls.py` | widget specs → `dict(label, mask, desc, column, aliases, kind, choice)`; `stats()` decides cat vs num; `combine()` ANDs masks |
+| `controls.py` | widget specs → `dict(label, mask, desc, column, aliases, kind, choice)`; `stats()` decides cat vs num; `slider_limits()` (`RANGE_MODE` setting), `_slider_grid()`, `_carry_slider()` (value survives a limit change); `at_least` = N radio + threshold slider on the k-th largest columns (`loader.nth_columns()`, hidden `__nth_*`); `combine()` ANDs masks |
 | `plots.py` | weighted histograms with Plotly: `bin_index()` (lookup table / arithmetic / searchsorted), `hist1d()` (before vs after, ratio, stacks, cached "before" histogram), `hist2d()`, `composition()`, `cutflow()`, `yields_by()`, palette + `segment_colours()` |
 | `preset.py` | preset discovery in the `NTUPLE_EXPLORER_PRESETS` folders, `validate()` (allowed `KEYS`, control `KINDS`, composition `NORMS`), categories → nested-ternary int expression, friend columns |
 
@@ -48,6 +48,9 @@ built and how to work on it.
   by position.
 - Streamlit "magic" writes any bare expression statement in `app.py` with `st.write`, which imports pyarrow and
   fails here: assign results (`_ = view[name]`), never leave an expression on its own line.
+- A widget's ID depends on its parameters (e.g. a slider's min / max): when they change, Streamlit makes a new
+  widget from `value` and writes to `st.session_state[key]` are ignored. To carry a value over, compute it and pass
+  it as `value` (see the range control: open handles follow the limits, kept in `<key>__lim`).
 - AppTest cannot drive single-choice button groups (`st.segmented_control`, `st.pills` single): any of them on the
   page breaks every `run()`. Use `st.radio(horizontal=True)` for single choices; multi-choice `st.pills` is fine.
 - `st.dataframe` needs pyarrow, which is broken in some conda envs: tables are rendered as HTML (`show_table`).
@@ -72,7 +75,7 @@ No test suite yet. What has been used so far:
    (`mode`, `file_<mode>`, `g_tree`, `g_scal`, `g_vec`, `g_red`, `ctl_<preset stem>_<control index>`,
    `ctl_<pid>_comp_rows`, `ctl_<pid>_newcols`, `ctl_<pid>_page_cols`, …; a two-valued multiselect is the radio
    `<key>__sw`, page chips are the button group `<key>__pills`, an integer slider on a few-valued column is
-   `<key>__range`) and check that `at.exception` and `at.error` are empty and the `Selected` metric changes.
+   `<key>__range`; an `at_least` control is `<key>__n` (radio) + `<key>__x` (slider), generic ones `ctl_generic_atl_<branch>`; app settings are `opt_*`, e.g. `opt_slider_range`) and check that `at.exception` and `at.error` are empty and the `Selected` metric changes.
 3. Numbers checked against an independent computation (numpy / the analysis' own code) for any preset feature that
    produces physics results.
 

@@ -76,7 +76,7 @@ class View:
         local = {n: _ne_safe(self[n]) for n in names}
         try:
             out = pd.eval(expr, local_dict=local, engine="numexpr" if _has_numexpr() else "python")
-        except Exception:       # noqa: BLE001 - helpers / C-style operators: numpy evaluator (its error if it fails too)
+        except Exception:       # noqa: BLE001 - helpers / C-style operators: numpy evaluator (its error if it fails)
             out = np_eval(expr, self)
         out = np.asarray(out)
         if out.shape == ():

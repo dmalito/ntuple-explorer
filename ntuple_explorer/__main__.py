@@ -24,7 +24,8 @@ def main(argv=None):
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data", default=os.environ.get("NTUPLE_EXPLORER_DATA", "."),
                     help="folder with the ROOT files (default: $NTUPLE_EXPLORER_DATA, else the current directory)")
-    ap.add_argument("--presets", action="append", default=[], help="folder with preset files (repeatable; default: $NTUPLE_EXPLORER_PRESETS)")
+    ap.add_argument("--presets", action="append", default=[],
+                    help="folder with preset files (repeatable; default: $NTUPLE_EXPLORER_PRESETS)")
     ap.add_argument("--cache", help="cache folder (default: <data>/.ntuple_cache)")
     ap.add_argument("--port", type=int, default=8501)
     ap.add_argument("--address", default="localhost", help="address to listen on (default: localhost only)")

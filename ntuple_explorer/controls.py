@@ -9,6 +9,8 @@ Kinds (spec["kind"]):
   checkboxes  options {label: expr}, default [labels], combine "or"|"and" - e.g. channels
   range       column, limits (lo, hi) (optional), default (lo, hi), step - slider; at a limit = open-ended
   toggle      expr, default bool, expr_off (optional)                - cut on / off
+  at_least    columns [k-th largest value, k = 0..], label, what, default (N, X) - "at least N objects with
+              value >= X": N (any = no cut) and a threshold slider; at its lower end only the count is required
   expr        default str                                            - free expression
 Expressions are strings over view columns (View.eval) or callables(view) -> bool array.
 """
@@ -17,6 +19,12 @@ import streamlit as st
 
 MAX_CATEGORIES = 20
 ALL = "all"             # first option of the 3-way switch of two-valued columns (no cut)
+# default range of sliders without preset limits (app setting): "quantiles" = 0.1-99.9 % quantiles; "snapped" = the
+# same, but an end moves to the true min / max when that is within SNAP of the range (hard thresholds such as
+# pT > 20 GeV stay reachable, far tails do not stretch the slider); "full" = min-max
+RANGE_MODES = ("snapped", "quantiles", "full")
+RANGE_MODE = "snapped"
+SNAP = 0.05
 
 
 # ----------------------------------------------------------------- column statistics (cached per dataset)
@@ -37,9 +45,22 @@ def stats(view, name, cache):
         s.update(kind="num", lo=float(lo), hi=float(hi), min=float(finite.min()), max=float(finite.max()),
                  integer=a.dtype.kind in "iu")
     else:
-        s.update(kind="num", lo=0.0, hi=1.0, min=0.0, max=1.0, integer=False)
+        s.update(kind="num", lo=0.0, hi=1.0, min=0.0, max=1.0, integer=False, empty=True)
     cache[name] = s
     return s
+
+
+def slider_limits(s, mode=None):
+    """(lo, hi) of a numeric column's slider from its stats() and the range mode (RANGE_MODE by default)."""
+    mode = mode or RANGE_MODE
+    if mode == "full":
+        return s["min"], s["max"]
+    lo, hi = s["lo"], s["hi"]
+    if mode == "snapped":
+        span = (hi - lo) or 1.0
+        lo = s["min"] if lo - s["min"] <= SNAP * span else lo
+        hi = s["max"] if s["max"] - hi <= SNAP * span else hi
+    return lo, hi
 
 
 def auto_spec(view, name, cache, labels=None, int_slider=True):
@@ -147,26 +168,13 @@ def render(spec, view, key, cache, container=st):
             lo, hi = min(s["values"]), max(s["values"])
             integer = True
         else:
-            lo, hi = s["lo"], s["hi"]
+            lo, hi = slider_limits(s)
             integer = s.get("integer", False)
         lo, hi = spec.get("limits", (lo, hi))
-        step = spec.get("step") or (1 if integer else None)
-        if integer or (step is not None and float(step).is_integer()):
-            lo, hi, step = int(np.floor(lo)), int(np.ceil(hi)), int(step or 1)
-        else:
-            lo, hi = float(lo), float(hi)
-            step = float(step or _nice_step(lo, hi))
-            lo, hi = np.floor(lo / step) * step, np.ceil(hi / step) * step
-            lo, hi = float(round(lo, 10)), float(round(hi, 10))
-        if hi <= lo:
-            hi = lo + step
+        lo, hi, step = _slider_grid(lo, hi, spec.get("step"), integer)
         d = spec.get("default", (lo, hi))
-        d = (max(lo, min(hi, d[0] if d[0] is not None else lo)), max(lo, min(hi, d[1] if d[1] is not None else hi)))
-        if isinstance(lo, int):
-            d = (int(d[0]), int(d[1]))
-        else:
-            d = (float(d[0]), float(d[1]))
-        a, b = container.slider(label, min_value=lo, max_value=hi, value=d, step=step, key=key, help=help_)
+        d = (d[0] if d[0] is not None else lo, d[1] if d[1] is not None else hi)
+        a, b = _carry_slider(container, label, lo, hi, d, step, key, help_=help_)
         # a handle at the slider limit leaves that side open (values beyond the limit are kept)
         x = view[col]
         m, parts = None, []
@@ -188,6 +196,31 @@ def render(spec, view, key, cache, container=st):
             out["desc"] = e if isinstance(e, str) else f"[{label}]"
         return out
 
+    if kind == "at_least":
+        cols = spec["columns"]
+        noun, what = label, spec.get("what", "value")
+        n0, x0 = spec.get("default", (0, None))
+        opts = ["any"] + [str(i) for i in range(1, len(cols) + 1)]
+        n = container.radio(f"{noun}: at least N", opts, index=min(int(n0), len(cols)), horizontal=True,
+                            key=f"{key}__n", help=help_)
+        n = 0 if n == "any" else int(n)
+        sts = [stats(view, c, cache) for c in cols]
+        lims = [lh for lh in map(_limits, sts) if lh is not None] or [(0.0, 1.0)]
+        lo, hi = min(lh[0] for lh in lims), max(lh[1] for lh in lims)
+        integer = all(s_["kind"] == "cat" for s_ in sts if not s_.get("empty"))
+        lo, hi, step = _slider_grid(lo, hi, spec.get("step"), integer)
+        x = _carry_slider(container, f"{what} ≥ (for those N)", lo, hi, x0 if x0 is not None else lo, step,
+                          f"{key}__x", single=True)
+        if n:
+            v = view[cols[n - 1]]
+            if x > lo:
+                out["mask"] = v >= x
+                out["desc"] = f"at least {n} {noun} with {what} >= {_fmt(x)}"
+            else:
+                out["mask"] = np.isfinite(v) if v.dtype.kind == "f" else np.ones(len(v), bool)
+                out["desc"] = f"at least {n} {noun}"
+        return out
+
     if kind == "expr":
         txt = container.text_input(label, value=spec.get("default", ""), key=key,
                                    help=help_ or "pandas.eval syntax over loaded columns, e.g. "
@@ -201,6 +234,42 @@ def render(spec, view, key, cache, container=st):
         return out
 
     raise ValueError(f"unknown control kind {kind!r}")
+
+
+def _limits(s):
+    """(lo, hi) slider limits from stats(), None for a column without finite values."""
+    if s.get("empty"):
+        return None
+    if s["kind"] == "cat":
+        return (min(s["values"]), max(s["values"])) if s["values"] else None
+    return slider_limits(s)
+
+
+def _slider_grid(lo, hi, step, integer):
+    """(lo, hi, step) on a nice grid: integers for integer data, else lo / hi rounded outwards to the step."""
+    if integer or (step is not None and float(step).is_integer()):
+        lo, hi, step = int(np.floor(lo)), int(np.ceil(hi)), int(step or 1)
+    else:
+        lo, hi = float(lo), float(hi)
+        step = float(step or _nice_step(lo, hi))
+        lo, hi = float(round(np.floor(lo / step) * step, 10)), float(round(np.ceil(hi / step) * step, 10))
+    return lo, (hi if hi > lo else lo + step), step
+
+
+def _carry_slider(container, label, lo, hi, default, step, key, single=False, help_=None):
+    """Slider whose value survives a change of its limits (a new widget for Streamlit): a handle at an old limit
+    goes to the new one, other values are clamped. default: value or (lo, hi) pair."""
+    cast = type(lo)
+    cur, old = st.session_state.get(key), st.session_state.get(f"{key}__lim")
+    if cur is not None and old is not None and tuple(old) != (lo, hi):
+        vals = [cur] if single else list(cur)
+        vals = [lo if v <= old[0] else hi if v >= old[1] else v for v in vals]
+        default = vals[0] if single else tuple(vals)
+    clamp = (lambda v: cast(max(lo, min(hi, v))))
+    default = clamp(default) if single else (clamp(default[0]), clamp(default[1]))
+    v = container.slider(label, min_value=lo, max_value=hi, value=default, step=step, key=key, help=help_)
+    st.session_state[f"{key}__lim"] = (lo, hi)
+    return v
 
 
 def _nice_step(lo, hi):

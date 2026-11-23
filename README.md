@@ -110,7 +110,10 @@ any loaded column:
   multiselect (clickable chips for page cuts);
 - other integer-like columns with ≤ 20 values (counts such as n jets, n soft muons) get an integer range slider, or a
   multiselect if you switch "Integer columns with ≤ 20 values as" to *selector* in the same expander;
-- other columns get a range slider (0.1–99.9 % quantiles; a handle left at its limit means "no cut on that side").
+- other columns get a range slider (a handle left at its limit means "no cut on that side"). Its range is set in
+  the sidebar *Settings*: the 0.1–99.9 % quantiles *snapped* to the true min / max when those are within 5 % of
+  the range (default: hard thresholds such as pT > 20 GeV stay reachable, far tails do not stretch the slider),
+  plain quantiles, or the full min–max range. Preset `limits` always win.
 
 The expression cut box takes the expressions described in *Selections*.
 
@@ -119,7 +122,12 @@ Vectors of 4-vectors (`ROOT::Math::LorentzVector`, `TLorentzVector`, split or no
 units), e.g. `jet_p4__pt0`; *size* is the multiplicity; *sum* / *max* / *min* act on pt. Vectors of other objects
 offer *size* only; single objects are not listed, but extra columns can read them (`x_pt = x.Pt()`). The helpers
 `nx_pt(v, i)`, `nx_eta`, `nx_phi`, `nx_e`, `nx_m` (−999 if the element is missing) and `nx_sum_pt(v)`,
-`nx_max_pt(v)`, `nx_min_pt(v)` can be used in any ROOT expression.
+`nx_max_pt(v)`, `nx_min_pt(v)` can be used in any ROOT expression, as can `nx_pts(v)` / `nx_etas` / `nx_phis` /
+`nx_es` / `nx_ms` (the component of every element, as a vector) and `nx_kth(values, k)` (k-th largest, NaN if
+fewer).
+
+*'At least N above X' cuts on* (number vectors and 4-vectors, pt) adds an *at least N objects with value ≥ X*
+control to the selection after Load (the `at_least` control kind below, up to N = 4).
 
 ## Presets
 
@@ -194,6 +202,7 @@ Control specs (`kind`):
 | `range` | `column`, `limits=(lo, hi)`, `default=(lo, hi)`, `step` | slider; a handle at a limit = open-ended |
 | `toggle` | `expr`, `default`, `expr_off` | cut on/off |
 | `expr` | `default` | free cut expression |
+| `at_least` | `vector` (4-vector branch) + `of="pt"` (or eta, phi, E, m), or `values` (any vector expression, e.g. `jet_pt / 1000.`); `where` (object requirement, e.g. `abs(jet_eta) < 2.5` or `abs(nx_etas(jet_p4)) < 2.5`), `max_n=4`, `default=(N, X)`, `what` | *at least N objects with value ≥ X*: N (any, 1 … max_n) and a threshold slider; at the slider's lower end only the count is required. Works because "at least N above X" = "the N-th largest above X": the loader stores the 1st … max_n-th largest value per entry (sorted in C++); `where` is fixed at load time |
 
 Common optional fields: `label`, `help`, `dropdown=True` (selectbox instead of radio), `place="main"` (a page cut
 above the tabs instead of a sidebar cut; see *Selections*).
