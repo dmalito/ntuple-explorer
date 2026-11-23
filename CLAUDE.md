@@ -22,7 +22,7 @@ built and how to work on it.
 | --- | --- |
 | `__main__.py` | launcher: `python -m ntuple_explorer --data DIR --presets DIR [--cache DIR] [--port N]`; sets `NTUPLE_EXPLORER_DATA` / `_PRESETS` / `_CACHE` and runs `streamlit run app.py` bound to localhost |
 | `app.py` | the Streamlit page: sidebar (data source, controls, *New columns*, save/load state), header metrics, *Page cuts* box (controls with `place="main"` + page cuts on any column; results tagged `page=True`: in every mask, but only one final cutflow row), tabs (Plots, 2D, Composition only if the preset has `compositions`, Cutflow & yields, preset custom tabs). `cached_load` (st.cache_resource) = main tree + joined friend trees |
-| `loader.py` | ROOT side: `load()` (Define + one `AsNumpy`, down-cast, npz cache), `branch_info()` / `trees()` via uproot (metadata only), `check_exprs()` / `split_missing()`, `join_friend()` + `match_index()` (join another tree on event keys), generic-mode `REDUCERS`, default helper `nx_at(v, i)` |
+| `loader.py` | ROOT side: `load()` (Define + one `AsNumpy`, down-cast, npz cache), `branch_info()` / `trees()` via uproot (metadata only), `check_exprs()` / `split_missing()`, `join_friend()` + `match_index()` (join another tree on event keys), generic-mode `REDUCERS` + `vector_columns()` (per element kind: number / 4-vector / object, from `element_kind()`), default helper `nx_at(v, i)` and `VECTOR_HELPERS` (`nx_pt` … `nx_max_pt`) |
 | `view.py` | `View`: name → array through aliases (set by alias controls), derived callables (preset, and the app's *New columns*), loaded columns; memoised per rerun, cycle detection; `eval()` = pandas.eval + numexpr, falling back to `np_eval()` (whitelisted AST on numpy: `FUNCS` helpers, `&& \|\| !`, `a if c else b`) |
 | `controls.py` | widget specs → `dict(label, mask, desc, column, aliases, kind, choice)`; `stats()` decides cat vs num; `combine()` ANDs masks |
 | `plots.py` | weighted histograms with Plotly: `bin_index()` (lookup table / arithmetic / searchsorted), `hist1d()` (before vs after, ratio, stacks, cached "before" histogram), `hist2d()`, `composition()`, `cutflow()`, `yields_by()`, palette + `segment_colours()` |
@@ -39,6 +39,13 @@ built and how to work on it.
   `expr_branches`, `_NOT_BRANCHES` for keywords). Keep this check in front of anything new that reaches `Define` / `Filter`.
 - `(u)int8_t` / `char` branches come back from `AsNumpy` as object arrays: `load()` wraps them in `int(...)`.
 - A column that is still a vector per entry raises a `TypeError` asking for a reduction; never pull raw vectors.
+- A JIT compile error *inside the event loop* (e.g. a numeric reducer such as `nx_at` on a vector of 4-vectors)
+  is an uncaught C++ exception: `abort`, whole process gone. `branch_info()` lists top-level branches only (split
+  objects appear once; uproot's `parent/parent.fX` sub-branch names are not valid column names) and tags the
+  element kind, so generic mode only offers reducers that compile for it.
+- Full loads run multithreaded: entries come back in a different order than in the file. Columns of one load are
+  consistent with each other; compare with uproot / other code by event keys (`runNumber`, `eventNumber`), not
+  by position.
 - Streamlit "magic" writes any bare expression statement in `app.py` with `st.write`, which imports pyarrow and
   fails here: assign results (`_ = view[name]`), never leave an expression on its own line.
 - AppTest cannot drive single-choice button groups (`st.segmented_control`, `st.pills` single): any of them on the

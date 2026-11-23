@@ -49,7 +49,8 @@ def cached_load(path, tree, columns_items, entries, prefilter, helpers, drop_mis
 
 
 @st.cache_data(show_spinner=False)
-def cached_branch_info(path, tree, mtime):
+def cached_branch_info(path, tree, mtime, version=2):
+    """version: bump when branch_info's output changes, so a running server does not serve the old table."""
     return loader.branch_info(path, tree)
 
 
@@ -137,19 +138,30 @@ with st.sidebar.expander("Data", expanded="active" not in st.session_state):
         tree = st.selectbox("Tree", tlist, key="g_tree")
         info = cached_branch_info(path, tree, mtime(path))
         st.caption(f"{info.attrs.get('entries', 0):,} entries · {len(info)} branches")
-        scal = info.loc[~info.is_vector, "branch"].tolist()
+        kinds = dict(zip(info.branch, info.element))
+        num = info.element == "number"
+        scal = info.loc[~info.is_vector & num, "branch"].tolist()
         vec = info.loc[info.is_vector, "branch"].tolist()
+        vtag = {"number": "", "lorentz": "  (4-vector)", "object": "  (objects: size only)"}
         sel_s = st.multiselect("Scalar branches", scal, key="g_scal")
-        sel_v = st.multiselect("Vector branches", vec, key="g_vec")
+        sel_v = st.multiselect("Vector branches", vec, key="g_vec", format_func=lambda b: b + vtag[kinds[b]])
         reds = st.multiselect("…reduced as", list(loader.REDUCERS), default=["element 0 (leading)"], key="g_red",
-                              help="each vector branch becomes one column per reducer")
+                              help="each vector branch becomes one column per reducer; for 4-vectors, element i "
+                                   "gives the components below, sum / max / min act on pt, counts do not apply")
+        comps = ["pt"]
+        if any(kinds[b] == "lorentz" for b in sel_v):
+            comps = st.multiselect("…4-vector components", loader.COMPONENTS, default=["pt"], key="g_comp",
+                                   help="of each chosen element (units as stored, e.g. MeV)")
+        other = info.loc[~info.is_vector & ~num, "branch"].tolist()
+        if other:
+            st.caption("Not listed (single objects): " + ", ".join(f"`{b}`" for b in other)
+                       + ". Read them with an extra column, e.g. `x_pt = x.Pt()`.")
         extra = st.text_area("Extra columns (`name = ROOT expression`, one per line)", key="g_extra",
-                             placeholder="nbtag = Sum(jet_select_GN2v01_FixedCutBEff_77_NOSYS == 1)")
+                             placeholder="nbtag = Sum(jet_btag == 1)\nlead_pt = nx_pt(jet_p4, 0)")
         prefilter = st.text_input("Pre-filter (ROOT expression, applied while reading)", key="g_pref")
         columns = {b: b for b in sel_s}
         for b in sel_v:
-            for r in reds:
-                columns[loader.reducer_name(b, r)] = loader.reducer_expr(b, r)
+            columns.update(loader.vector_columns(b, kinds[b], reds, comps))
         for line in extra.splitlines():
             if "=" in line and line.split("=", 1)[0].strip().isidentifier():
                 n, e = line.split("=", 1)

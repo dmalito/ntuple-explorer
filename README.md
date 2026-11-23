@@ -114,6 +114,13 @@ any loaded column:
 
 The expression cut box takes the expressions described in *Selections*.
 
+Vectors of 4-vectors (`ROOT::Math::LorentzVector`, `TLorentzVector`, split or not) are listed once, marked
+*(4-vector)*. Element *i* gives the components chosen in *…4-vector components* (pt, eta, phi, E, m, in the stored
+units), e.g. `jet_p4__pt0`; *size* is the multiplicity; *sum* / *max* / *min* act on pt. Vectors of other objects
+offer *size* only; single objects are not listed, but extra columns can read them (`x_pt = x.Pt()`). The helpers
+`nx_pt(v, i)`, `nx_eta`, `nx_phi`, `nx_e`, `nx_m` (−999 if the element is missing) and `nx_sum_pt(v)`,
+`nx_max_pt(v)`, `nx_min_pt(v)` can be used in any ROOT expression.
+
 ## Presets
 
 A preset is a Python file defining `PRESET = dict(...)`, in a `--presets` folder or in `presets/` at the repository

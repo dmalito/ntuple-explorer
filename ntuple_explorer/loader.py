@@ -23,6 +23,21 @@ DEFAULT_HELPERS = """
 template <typename V> double nx_at(const V& v, std::size_t i) { return i < v.size() ? double(v[i]) : -999.; }
 """
 
+# 4-vector components of element i (ROOT::Math::LorentzVector, TLorentzVector: same method names), -999 if missing,
+# and pt sum / max / min over the vector; declared with DEFAULT_HELPERS, used by generic-mode reducers
+VECTOR_HELPERS = """
+template <typename V> double nx_pt(const V& v, std::size_t i) { return i < v.size() ? double(v[i].Pt()) : -999.; }
+template <typename V> double nx_eta(const V& v, std::size_t i) { return i < v.size() ? double(v[i].Eta()) : -999.; }
+template <typename V> double nx_phi(const V& v, std::size_t i) { return i < v.size() ? double(v[i].Phi()) : -999.; }
+template <typename V> double nx_e(const V& v, std::size_t i) { return i < v.size() ? double(v[i].E()) : -999.; }
+template <typename V> double nx_m(const V& v, std::size_t i) { return i < v.size() ? double(v[i].M()) : -999.; }
+template <typename V> double nx_sum_pt(const V& v) { double s = 0; for (auto& x : v) s += x.Pt(); return s; }
+template <typename V> double nx_max_pt(const V& v) {
+  double m = -999.; for (auto& x : v) if (x.Pt() > m) m = x.Pt(); return m; }
+template <typename V> double nx_min_pt(const V& v) {
+  double m = -999.; for (auto& x : v) if (m == -999. || x.Pt() < m) m = x.Pt(); return m; }
+"""
+
 _declared = set()
 _CHAR_TYPES = {"Char_t", "UChar_t", "char", "unsigned char", "signed char", "int8_t", "uint8_t"}
 _ROOT = None
@@ -60,18 +75,33 @@ def trees(path):
         return [k.split(";")[0] for k, cls in f.classnames().items() if cls in ("TTree", "TNtuple")]
 
 
+def element_kind(branch):
+    """What one entry (or vector element) of an uproot branch holds: "number", "lorentz" (LorentzVector /
+    TLorentzVector, read through Pt() Eta() Phi() E() M()) or "object" (anything else: only its size is usable)."""
+    import uproot
+    if "LorentzVector" in branch.typename:
+        return "lorentz"
+    try:
+        interp = branch.interpretation
+    except Exception:       # noqa: BLE001 - uproot cannot interpret it
+        return "object"
+    interp = getattr(interp, "content", interp)      # AsJagged(AsDtype) -> AsDtype
+    return "number" if isinstance(interp, uproot.interpretation.numerical.AsDtype) else "object"
+
+
 def branch_info(path, tree):
-    """DataFrame: branch, type, is_vector (std::vector / RVec / C array), entries."""
+    """DataFrame: branch, type, is_vector (std::vector / RVec / C array), element ("number" / "lorentz" / "object"),
+    entries. Top-level branches only: a split object (e.g. a vector of 4-vectors) is one branch, read whole by
+    RDataFrame; its uproot sub-branches (parent/parent.fCoordinates.fPt) are not valid column names."""
     import uproot
     with uproot.open(resolve(path)) as f:
         t = f[tree]
         rows = []
-        for name in t.keys():
+        for name in t.keys(recursive=False):
             b = t[name]
-            if len(b.branches):          # split TLorentzVector parents etc.: keep the leaves
-                continue
             tn = b.typename
-            rows.append(dict(branch=name, type=tn, is_vector=("vector" in tn or "RVec" in tn or "[" in tn)))
+            rows.append(dict(branch=name, type=tn, is_vector=("vector" in tn or "RVec" in tn or "[" in tn),
+                             element=element_kind(b)))
         n = t.num_entries
     df = pd.DataFrame(rows)
     df.attrs["entries"] = n
@@ -165,6 +195,7 @@ def load(path, tree, columns, entries=None, prefilter=None, helpers=DEFAULT_HELP
     check_exprs(p, tree, list(columns.values()) + ([prefilter] if prefilter else []))
     ROOT = _root()
     declare(DEFAULT_HELPERS)
+    declare(VECTOR_HELPERS)
     declare(helpers)
     if entries:
         ROOT.DisableImplicitMT()          # Range() is single-threaded only
@@ -310,3 +341,23 @@ def reducer_name(branch, reducer):
     tag = {"element 0 (leading)": "0", "element 1": "1", "element 2": "2", "size": "n", "count > 0": "npos",
            "count == 1": "n1", "sum": "sum", "max": "max", "min": "min"}[reducer]
     return f"{branch}__{tag}"
+
+
+COMPONENTS = ["pt", "eta", "phi", "E", "m"]          # of 4-vector elements
+
+
+def vector_columns(branch, element, reducers, components=("pt",)):
+    """{column name: ROOT expression} for one vector branch and the chosen reducers. Numbers: REDUCERS. 4-vectors:
+    "element i" -> each chosen component of element i (branch__pt0, ...), size, sum / max / min -> of pt; the
+    count reducers do not apply. Other objects: size only."""
+    out = {}
+    for r in reducers:
+        if element == "number" or r == "size":
+            out[reducer_name(branch, r)] = reducer_expr(branch, r)
+        elif element == "lorentz" and r.startswith("element"):
+            i = reducer_name(branch, r).rsplit("__", 1)[1]
+            for c in components:
+                out[f"{branch}__{c.lower()}{i}"] = f"nx_{c.lower()}({branch}, {i})"
+        elif element == "lorentz" and r in ("sum", "max", "min"):
+            out[f"{branch}__{r}pt"] = f"nx_{r}_pt({branch})"
+    return out
